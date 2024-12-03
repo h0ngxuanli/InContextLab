@@ -1,0 +1,4122 @@
+Directory Structure:
+
+└── ./
+    ├── icl
+    │   ├── analysis
+    │   │   ├── __init__.py
+    │   │   ├── activation_analysis.py
+    │   │   ├── attentioner_for_attribution.py
+    │   │   ├── attentioner_for_train.py
+    │   │   ├── attentioner.py
+    │   │   ├── compress_time.py
+    │   │   ├── compress_top.py
+    │   │   ├── compress.py
+    │   │   ├── deep_layer.py
+    │   │   ├── n_classification.py
+    │   │   ├── numpy_writer.py
+    │   │   ├── qkv_getter.py
+    │   │   ├── reweighting.py
+    │   │   ├── shallow_layer_non_label.py
+    │   │   └── shallow_layer.py
+    │   ├── lm_apis
+    │   │   ├── __init__.py
+    │   │   └── lm_api_base.py
+    │   ├── util_classes
+    │   │   ├── __init__.py
+    │   │   ├── arg_classes.py
+    │   │   ├── context_solver.py
+    │   │   ├── predictor_classes.py
+    │   │   └── setter_with_restore.py
+    │   ├── utils
+    │   │   ├── __init__.py
+    │   │   ├── data_wrapper.py
+    │   │   ├── display_utils.py
+    │   │   ├── experiment_utils.py
+    │   │   ├── load_huggingface_dataset.py
+    │   │   ├── load_local.py
+    │   │   ├── other.py
+    │   │   ├── prepare_model_and_tokenizer.py
+    │   │   ├── random_utils.py
+    │   │   └── visualization.py
+    │   ├── __init__.py
+    │   └── project_constants.py
+    ├── attention_attr.py
+    ├── do_compress_time.py
+    ├── do_compress_top.py
+    ├── do_compress.py
+    ├── do_deep_layer.py
+    ├── do_nclassify.py
+    ├── do_shallow_layer_non_label.py
+    ├── do_shallow_layer.py
+    ├── experiment_attn_attr.py
+    ├── experiment_compress_time.py
+    ├── experiment_compress.py
+    ├── experiment_deep.py
+    ├── experiment_ncls.py
+    ├── experiment_reweighting.py
+    ├── experiment_shallow.py
+    ├── grad_demo.py
+    └── reweighting.py
+
+
+
+---
+File: /icl/analysis/__init__.py
+---
+
+
+
+
+---
+File: /icl/analysis/activation_analysis.py
+---
+
+import os
+import shutil
+import torch
+from .numpy_writer import CPUTensorBufferDict, NumpyWriter
+
+_save_dict = None
+_save_activation = False
+_save_activation_grad = False
+_save_debug = False
+_writer_np = None
+
+def set_save_activation(value):
+    global _save_activation
+    _save_activation = value
+
+def get_save_activation():
+    return _save_activation
+
+def set_save_activation_grad(value):
+    global _save_activation_grad
+    _save_activation_grad = value
+
+def get_save_activation_grad():
+    return _save_activation_grad
+
+def set_debug(value):
+    global _save_debug
+    _save_debug = value
+
+def get_debug():
+    return _save_debug
+    
+def clear_save_dict():
+    _save_dict.clear()
+
+def set_save_dict(writer_np):
+    global _save_dict
+    if _save_dict is not None and writer_np is not None:
+        raise RuntimeError("save_dict已经存在")
+    if writer_np is None:
+        _save_dict = None
+    else:
+        _save_dict = CPUTensorBufferDict(writer_np=writer_np)
+
+def set_writer_np(writer_np):
+    global _writer_np
+    if _writer_np is not None and writer_np is not None:
+        raise RuntimeError("writer_np已经存在")
+    _writer_np = writer_np
+    set_save_dict(writer_np)
+
+def get_writer_np():
+    return _writer_np
+
+def debug_fn(func):
+    def wrapper(*args, **kwargs):
+        if get_debug():
+            return func(*args, **kwargs)
+        else:
+            return None
+    return wrapper
+
+debug_print = debug_fn(print)
+
+def _add_tensor(name, value, save_type = 'activation', mode = None, log_interval = None):
+    global _save_dict
+    save_dict = _save_dict
+    # 也许需要更多处理，比如处理bf16
+    debug_print(f"add_{save_type} {name} {value.shape} {value.dtype}", flush=True)
+    if isinstance(value, torch.Tensor):
+        value = value.detach().clone()
+
+        if mode == 'ijk->(i*j)k' or 'ij->ij': # 这里可以在把几个batch的数据拼接起来，变成（num_token, dim）（对于attention不适用，用在hidden上）
+            value = value.reshape(-1, value.shape[-1])
+        else:
+            raise RuntimeError(f"不支持的 mode {mode}")
+        
+        if log_interval is not None: # 可以跳着存储，每几个token存 （对于attention不适用，用在hidden上）
+            assert mode is not None, "log_interval需要mode"
+            value = value[::log_interval,...]
+
+        if value.dtype == torch.bfloat16 or value.dtype == torch.float16:
+            value = value.float()
+        value = value.cpu()
+        value = value.numpy()
+        save_dict[name].append(value)
+    else:
+        raise RuntimeError(f"不支持的类型 {type(value)}")
+
+def add_activation(input, name, mode = None, log_interval = None):
+    if not get_save_activation():
+        return
+    _add_tensor(name, input, 'activation', mode, log_interval)
+    return input
+
+def _add_activation_grad(input, name, mode = None, log_interval = None):
+    if not get_save_activation_grad():
+        return
+    _add_tensor(name, input, 'activation_grad', mode, log_interval)
+
+class IdentityToCatchGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, name, mode, log_interval):
+        if not get_save_activation_grad():
+            return input
+        ctx.name = name
+        ctx.mode = mode
+        ctx.log_interval = log_interval
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if not get_save_activation_grad():
+            return grad_output
+        _add_activation_grad(grad_output, ctx.name, ctx.mode, ctx.log_interval)
+        return grad_output, None, None, None
+    
+def add_activation_grad(input, name, mode = None, log_interval = None):
+    if not name.endswith('_grad'):
+        name = name + '_grad'
+    if not get_save_activation_grad():
+        return input
+    input.requires_grad_(True)
+    input = IdentityToCatchGrad.apply(input, name, mode, log_interval) # can not set requires_grad=True in this
+    return input
+
+def force_save_write_clear():
+    debug_print("force_activation_write_clear")
+    debug_print("save_dict", _save_dict.keys())
+    for name, buffer in _save_dict.items():
+        buffer._write()
+    clear_save_dict()
+
+def start_save(log_dir, save_activation = False, save_activation_grad = False, debug = False, continue_run = False, cover = False):
+    assert save_activation or save_activation_grad, "没有需要保存的东西" 
+    mode = 'a' if continue_run else 'w'
+    writer_np = NumpyWriter(log_dir=log_dir, mode = mode, cover = cover)
+    set_writer_np(writer_np)
+    set_save_activation(save_activation)
+    set_save_activation_grad(save_activation_grad)
+    set_debug(debug)
+
+def end_save():
+    set_save_activation(False)
+    set_save_activation_grad(False)
+    force_save_write_clear()
+    set_writer_np(None)
+
+def get_result(log_dir, name, idxs=None, condition=None):
+    writer_np = NumpyWriter(log_dir=log_dir, mode = 'r')
+    return writer_np.read(name, idxs, condition)
+
+
+    
+
+
+    
+
+
+
+---
+File: /icl/analysis/attentioner_for_attribution.py
+---
+
+import warnings
+from typing import Callable, Optional, List, Union
+from functools import wraps, partial
+import torch
+from torch import nn
+from torch.nn import functional as F
+from transformers import PreTrainedModel
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
+
+
+class AttentionAdapterBase(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.use_flag = True
+
+    def forward(self, attn_weights):
+        if self.use_flag:
+            return self._forward(attn_weights)
+        else:
+            return attn_weights
+
+    def _forward(self, attn_weights):
+        raise NotImplementedError
+
+    def register_input_ids(self, input_ids: torch.Tensor):
+        self.input_ids = input_ids
+
+
+def gpt2_attn(self, query, key, value, attention_mask=None, head_mask=None, attention_adapter=None):
+    attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+    if self.scale_attn_weights:
+        attn_weights = attn_weights / (float(value.size(-1)) ** 0.5)
+
+    if self.scale_attn_by_inverse_layer_idx:
+        attn_weights = attn_weights / float(self.layer_idx + 1)
+
+    if not self.is_cross_attention:
+        query_length, key_length = query.size(-2), key.size(-2)
+        causal_mask = self.bias[:, :, key_length - query_length: key_length, :key_length].bool()
+        attn_weights = torch.where(causal_mask, attn_weights,
+                                   self.masked_bias.to(attn_weights.dtype))
+
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    attn_weights = nn.Softmax(dim=-1)(attn_weights)
+
+    if attention_adapter is not None:
+        attn_weights = attention_adapter(attn_weights)
+
+    attn_weights = attn_weights.type(value.dtype)
+    attn_weights = self.attn_dropout(attn_weights)
+
+    if head_mask is not None:
+        attn_weights = attn_weights * head_mask
+
+    attn_output = torch.matmul(attn_weights, value)
+
+    return attn_output, attn_weights
+
+
+
+class AttentionerManagerBase:
+    def __init__(self, model: PreTrainedModel):
+        self.model = model
+        self.attention_adapters = self.register_attentioner_to_model()
+        self.model.forward = manager_decoractor(self)(self.model.forward)
+
+    @property
+    def input_ids(self):
+        return self._input_ids
+
+    @input_ids.setter
+    def input_ids(self, input_ids):
+        self._input_ids = input_ids
+        for attention_adapter in self.attention_adapters:
+            attention_adapter.register_input_ids(input_ids)
+
+    def register_input_ids(self, input_ids):
+        self.input_ids = input_ids
+
+    def register_attentioner_to_model(self):
+        raise NotImplementedError
+
+    def zero_grad(self,set_to_none=True):
+        if set_to_none:
+            for attention_adapter in self.attention_adapters:
+                attention_adapter.params = None
+        else:
+            for attention_adapter in self.attention_adapters:
+                attention_adapter.zero_grad(set_to_none=True)
+
+    def grad_process(self, grad,use_abs = True):
+        assert len(grad.shape) == 4
+        grad = grad.sum(1)
+        if use_abs:
+            grad = abs(grad)
+        return grad
+
+    def grad(self,*args,**kwargs):
+        grads = []
+        for attention_adapter in self.attention_adapters:
+            grads.append(self.grad_process(attention_adapter.params.grad,*args,**kwargs))
+        return grads
+
+
+def manager_decoractor(manager: AttentionerManagerBase):
+    def model_forward_decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            input_ids = kwargs.get('input_ids', None)
+            if input_ids is None:
+                input_ids = args[0]
+            manager.register_input_ids(input_ids)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return model_forward_decorator
+
+
+class GPT2AttentionerManager(AttentionerManagerBase):
+    def __init__(self, model: PreTrainedModel):
+        super().__init__(model)
+
+    def register_attentioner_to_model(self):
+        attention_adapters = []
+        for i, layer in enumerate(self.model.transformer.h):
+            attention_adapter = AttentionAdapter()
+            layer.attn._attn = partial(gpt2_attn, layer.attn,
+                                       attention_adapter=attention_adapter)
+            attention_adapters.append(attention_adapter)
+        return attention_adapters
+
+
+class AttentionAdapter(AttentionAdapterBase):
+    def __init__(self) -> None:
+        super().__init__()
+        self.params = None
+
+    def _forward(self, attn_weights):
+        if self.params is None:
+            self.params = torch.ones_like(attn_weights, requires_grad=True)
+        else:
+            self.params.data = torch.ones_like(attn_weights)
+        return attn_weights * self.params
+
+    @property
+    def grad(self):
+        return self.params.grad
+
+    def zero_grad(self, set_to_none: bool = False) -> None:
+        if self.params.grad is not None:
+            if set_to_none:
+                self.params.grad = None
+            else:
+                self.params.grad = torch.zeros_like(self.params.grad)
+
+
+
+---
+File: /icl/analysis/attentioner_for_train.py
+---
+
+import warnings
+from typing import Callable, Optional, List, Union
+from functools import wraps, partial
+import torch
+from torch import nn
+from torch.nn import functional as F
+from transformers import PreTrainedModel
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
+
+from icl.util_classes.predictor_classes import Predictor
+
+
+class AttentionAdapterBase(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.use_flag = True
+
+    def forward(self, attn_weights):
+        if self.use_flag:
+            return self._forward(attn_weights)
+        else:
+            return attn_weights
+
+    def _forward(self, attn_weights):
+        raise NotImplementedError
+
+    def register_input_ids(self, input_ids: torch.Tensor):
+        self.input_ids = input_ids
+
+
+def gpt2_attn(self, query, key, value, attention_mask=None, head_mask=None, attention_adapter=None):
+    attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+    if self.scale_attn_weights:
+        attn_weights = attn_weights / (float(value.size(-1)) ** 0.5)
+
+    if self.scale_attn_by_inverse_layer_idx:
+        attn_weights = attn_weights / float(self.layer_idx + 1)
+
+    if not self.is_cross_attention:
+        query_length, key_length = query.size(-2), key.size(-2)
+        causal_mask = self.bias[:, :, key_length - query_length: key_length, :key_length].bool()
+        attn_weights = torch.where(causal_mask, attn_weights,
+                                   self.masked_bias.to(attn_weights.dtype))
+
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    attn_weights = nn.Softmax(dim=-1)(attn_weights)
+
+    if attention_adapter is not None:
+        attn_weights = attention_adapter(attn_weights)
+
+    attn_weights = attn_weights.type(value.dtype)
+    attn_weights = self.attn_dropout(attn_weights)
+
+    if head_mask is not None:
+        attn_weights = attn_weights * head_mask
+
+    attn_output = torch.matmul(attn_weights, value)
+
+    return attn_output, attn_weights
+
+
+class AttentionerManagerBase:
+    def __init__(self, model: PreTrainedModel, predictor: Predictor, n_demo, device,n_head):
+        self.n_demo = n_demo
+        self.n_head = n_head
+        self.device = device
+        self.model = model
+        self.attention_adapters = self.register_attentioner_to_model()
+        self.model.forward = manager_decoractor(self)(self.model.forward)
+        self.predictor = predictor
+
+    @property
+    def input_ids(self):
+        return self._input_ids
+
+    @input_ids.setter
+    def input_ids(self, input_ids):
+        self._input_ids = input_ids
+        class_poss, final_poss = self.predictor.get_pos({'input_ids': input_ids})
+        for attention_adapter in self.attention_adapters:
+            attention_adapter.register_input_ids(input_ids)
+            attention_adapter.class_poss = class_poss
+            attention_adapter.final_poss = final_poss
+
+    def register_input_ids(self, input_ids):
+        self.input_ids = input_ids
+
+    def register_attentioner_to_model(self):
+        raise NotImplementedError
+
+    def zero_grad(self, set_to_none=True):
+        if set_to_none:
+            for attention_adapter in self.attention_adapters:
+                attention_adapter.params = None
+        else:
+            for attention_adapter in self.attention_adapters:
+                attention_adapter.zero_grad(set_to_none=True)
+
+    def grad_process(self, grad, use_abs=True):
+        assert len(grad.shape) == 4
+        grad = grad.sum(1)
+        if use_abs:
+            grad = abs(grad)
+        return grad
+
+    def grad(self, *args, **kwargs):
+        grads = []
+        for attention_adapter in self.attention_adapters:
+            grads.append(self.grad_process(attention_adapter.params.grad, *args, **kwargs))
+        return grads
+
+    def params(self):
+        params = []
+        for attention_adapter in self.attention_adapters:
+            params.append(attention_adapter.weight)
+        return params
+
+
+def manager_decoractor(manager: AttentionerManagerBase):
+    def model_forward_decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            input_ids = kwargs.get('input_ids', None)
+            if input_ids is None:
+                input_ids = args[0]
+            manager.register_input_ids(input_ids)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return model_forward_decorator
+
+
+class GPT2AttentionerManager(AttentionerManagerBase):
+    def __init__(self, model: PreTrainedModel, n_demo, predictor: Predictor, device, n_head=1):
+        super().__init__(model, predictor, n_demo, device,n_head=n_head)
+
+    def register_attentioner_to_model(self):
+        attention_adapters = []
+        for i, layer in enumerate(self.model.transformer.h):
+            attention_adapter = AttentionAdapter(n_demo=self.n_demo, device=self.device,
+                                                 n_head=self.n_head)
+            layer.attn._attn = partial(gpt2_attn, layer.attn,
+                                       attention_adapter=attention_adapter)
+            attention_adapters.append(attention_adapter)
+        return attention_adapters
+
+
+class AttentionAdapter(AttentionAdapterBase):
+    def __init__(self, n_demo, n_head, device) -> None:
+        super().__init__()
+        self.n_demo = n_demo
+        self.n_head = n_head
+        self.weight = torch.nn.Parameter(
+            torch.zeros((n_head, n_demo), requires_grad=True, device=device))
+        self.class_poss = None
+        self.final_poss = None
+
+    def _forward(self, attn_weights):
+        class_poss = self.class_poss
+        final_poss = self.final_poss
+        weight = self.weight.exp()
+        bsz, n_head, seq_len, _ = attn_weights.shape
+        assert bsz == 1
+        mask_mat = torch.ones((1, n_head, seq_len, seq_len), device=attn_weights.device)
+        mask_mat[:, :, final_poss, class_poss] = weight.reshape(1, self.n_head, self.n_demo)
+        return attn_weights * mask_mat
+
+    @property
+    def grad(self):
+        return self.weight.grad
+
+    def zero_grad(self, set_to_none: bool = False) -> None:
+        if self.weight.grad is not None:
+            if set_to_none:
+                self.weight.grad = None
+            else:
+                self.weight.grad = torch.zeros_like(self.weight.grad)
+
+
+
+---
+File: /icl/analysis/attentioner.py
+---
+
+import random
+import warnings
+from typing import Callable, Optional, List, Union
+from functools import wraps, partial
+import torch
+from torch import nn
+from torch.nn import functional as F
+from transformers import PreTrainedModel
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
+
+
+class AttentionAdapterBase(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.use_flag = False
+
+    def forward(self, attn_weights):
+        if self.use_flag:
+            return self._forward(attn_weights)
+        else:
+            return attn_weights
+
+    def _forward(self, attn_weights):
+        raise NotImplementedError
+
+    def register_input_ids(self, input_ids: torch.Tensor):
+        self.input_ids = input_ids
+
+
+def gpt2_attn(self, query, key, value, attention_mask=None, head_mask=None, attention_adapter=None):
+    attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+    if self.scale_attn_weights:
+        attn_weights = attn_weights / (float(value.size(-1)) ** 0.5)
+
+    if self.scale_attn_by_inverse_layer_idx:
+        attn_weights = attn_weights / float(self.layer_idx + 1)
+
+    if not self.is_cross_attention:
+        query_length, key_length = query.size(-2), key.size(-2)
+        causal_mask = self.bias[:, :, key_length - query_length: key_length, :key_length].bool()
+        attn_weights = torch.where(causal_mask, attn_weights,
+                                   self.masked_bias.to(attn_weights.dtype))
+
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    if attention_adapter is not None:
+        attn_weights = attention_adapter(attn_weights)
+
+    attn_weights = nn.Softmax(dim=-1)(attn_weights)
+
+    attn_weights = attn_weights.type(value.dtype)
+    attn_weights = self.attn_dropout(attn_weights)
+
+    if head_mask is not None:
+        attn_weights = attn_weights * head_mask
+
+    attn_output = torch.matmul(attn_weights, value)
+
+    return attn_output, attn_weights
+
+
+def gptj_attn(self, query, key, value, attention_mask=None, head_mask=None, attention_adapter=None):
+    query_length, key_length = query.size(-2), key.size(-2)
+    causal_mask = self.bias[:, :, key_length - query_length: key_length, :key_length]
+
+    query = query.to(torch.float32)
+    key = key.to(torch.float32)
+
+    attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+    mask_value = torch.finfo(attn_weights.dtype).min
+    mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
+    attn_weights = torch.where(causal_mask, attn_weights, mask_value)
+
+    attn_weights = attn_weights / self.scale_attn
+
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    if attention_adapter is not None:
+        attn_weights = attention_adapter(attn_weights)
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+    attn_weights = attn_weights.to(value.dtype)
+    attn_weights = self.attn_dropout(attn_weights)
+
+    if head_mask is not None:
+        attn_weights = attn_weights * head_mask
+
+    attn_output = torch.matmul(attn_weights, value)
+
+    return attn_output, attn_weights
+
+
+class AttentionerManagerBase:
+    def __init__(self, model: PreTrainedModel, attention_adapters: List[AttentionAdapterBase]):
+        self.model = model
+        self.attention_adapters = attention_adapters
+        self.model.forward = manager_decoractor(self)(self.model.forward)
+        self.register_attentioner_to_model()
+
+    @property
+    def input_ids(self):
+        return self._input_ids
+
+    @input_ids.setter
+    def input_ids(self, input_ids):
+        self._input_ids = input_ids
+        for attention_adapter in self.attention_adapters:
+            attention_adapter.register_input_ids(input_ids)
+
+    def register_input_ids(self, input_ids):
+        self.input_ids = input_ids
+
+    def register_attentioner_to_model(self):
+        raise NotImplementedError
+
+    def set_attentioner_state(self, use_flag: bool,
+                              attention_adapter_idxs: Optional[Union[int, List[int]]] = None):
+        if attention_adapter_idxs is None:
+            attention_adapter_idxs = range(len(self.attention_adapters))
+        elif isinstance(attention_adapter_idxs, int):
+            attention_adapter_idxs = [attention_adapter_idxs]
+        for attention_adapter_idx in attention_adapter_idxs:
+            self.attention_adapters[attention_adapter_idx].use_flag = use_flag
+
+
+def manager_decoractor(manager: AttentionerManagerBase):
+    def model_forward_decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            input_ids = kwargs.get('input_ids', None)
+            if input_ids is None:
+                input_ids = args[0]
+            manager.register_input_ids(input_ids)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return model_forward_decorator
+
+
+class GPT2AttentionerManager(AttentionerManagerBase):
+    def __init__(self, model: PreTrainedModel, attention_adapters: List[AttentionAdapterBase]):
+        super().__init__(model, attention_adapters)
+
+    def register_attentioner_to_model(self):
+        for i, layer in enumerate(self.model.transformer.h):
+            layer.attn._attn = partial(gpt2_attn, layer.attn,
+                                       attention_adapter=self.attention_adapters[i])
+
+
+class GPTJAttentionerManager(AttentionerManagerBase):
+    def __init__(self, model: PreTrainedModel, attention_adapters: List[AttentionAdapterBase]):
+        super().__init__(model, attention_adapters)
+
+    def register_attentioner_to_model(self):
+        for i, layer in enumerate(self.model.transformer.h):
+            layer.attn._attn = partial(gptj_attn, layer.attn,
+                                       attention_adapter=self.attention_adapters[i])
+
+
+class AttentionAdapter(AttentionAdapterBase):
+    def __init__(self, label_id_dict, pad_token_id, task_name, tokenizer, window_size=None) -> None:
+        super().__init__()
+        self.label_id_dict = label_id_dict
+        self.pad_token_id = pad_token_id
+        self.task_name = task_name
+        self.tokenizer = tokenizer
+        self.window_size = window_size
+        if self.window_size is not None:
+            warnings.warn(
+                "window_size is not used")
+
+        if task_name == 'sst2':
+            self.prefix_idxs = [tokenizer.encode('Sentiment')[-1], tokenizer.encode(':')[0]]
+        elif task_name == 'agnews':
+            self.prefix_idxs = [tokenizer.encode('Answer')[-1], tokenizer.encode(':')[0]]
+        elif task_name == 'trec':
+            self.prefix_idxs = [tokenizer.encode(' Type')[-1], tokenizer.encode(':')[0]]
+        elif task_name == 'emo':
+            self.prefix_idxs = [tokenizer.encode('Emotion')[-1], tokenizer.encode(':')[0]]
+        else:
+            raise NotImplementedError(f"task_name: {task_name}")
+
+    def get_pos(self, input_ids, label_id_dict, pad_token_id):
+        ori_input_ids = input_ids.detach().clone()
+        final_pos = torch.ne(ori_input_ids, pad_token_id).int().sum(-1) - 1
+        device = ori_input_ids.device
+        bsz, sql = ori_input_ids.shape
+        class_poss = []
+        for idx in label_id_dict.values():
+            class_idx = idx
+            for offset, prefix_idx in enumerate(reversed(self.prefix_idxs)):
+                class_idx += prefix_idx * 100000 ** (offset + 1)
+            input_ids = ori_input_ids.detach().clone()
+            input_ids[:, 1:] += ori_input_ids[:, :-1] * 100000
+            input_ids[:, 2:] += ori_input_ids[:, :-2] * 100000 * 100000
+            class_pos = torch.arange(sql, device=device).unsqueeze(0).repeat(bsz, 1)[
+                input_ids == class_idx].reshape(bsz, -1)
+            class_poss.append(class_pos)
+        return class_poss, final_pos
+
+    def _forward(self, attn_weights):
+        class_poss, final_pos = self.get_pos(self.input_ids, self.label_id_dict, self.pad_token_id)
+        bsz, sql = self.input_ids.shape
+        for class_pos in class_poss:
+            for b_idx in range(bsz):
+                for single_class_pos in class_pos[b_idx]:
+                    attn_weights[b_idx, :,
+                    single_class_pos: single_class_pos + self.window_size + 1,
+                    :single_class_pos] = -10000.
+        return attn_weights
+
+class AttentionAdapterNonLabel(AttentionAdapterBase):
+    def __init__(self, label_id_dict, pad_token_id, task_name, tokenizer, window_size=None) -> None:
+        super().__init__()
+        self.label_id_dict = label_id_dict
+        self.pad_token_id = pad_token_id
+        self.task_name = task_name
+        self.tokenizer = tokenizer
+        self.window_size = window_size
+        if self.window_size is not None:
+            warnings.warn(
+                "window_size is not used")
+
+        if task_name == 'sst2':
+            self.prefix_idxs = [tokenizer.encode('Sentiment')[-1], tokenizer.encode(':')[0]]
+        elif task_name == 'agnews':
+            self.prefix_idxs = [tokenizer.encode('Answer')[-1], tokenizer.encode(':')[0]]
+        elif task_name == 'trec':
+            self.prefix_idxs = [tokenizer.encode(' Type')[-1], tokenizer.encode(':')[0]]
+        elif task_name == 'emo':
+            self.prefix_idxs = [tokenizer.encode('Emotion')[-1], tokenizer.encode(':')[0]]
+        else:
+            raise NotImplementedError(f"task_name: {task_name}")
+
+    def get_pos(self, input_ids, label_id_dict, pad_token_id):
+        ori_input_ids = input_ids.detach().clone()
+        final_pos = torch.ne(ori_input_ids, pad_token_id).int().sum(-1) - 1
+        device = ori_input_ids.device
+        bsz, sql = ori_input_ids.shape
+        class_poss = []
+        for idx in label_id_dict.values():
+            class_idx = idx
+            for offset, prefix_idx in enumerate(reversed(self.prefix_idxs)):
+                class_idx += prefix_idx * 100000 ** (offset + 1)
+            input_ids = ori_input_ids.detach().clone()
+            input_ids[:, 1:] += ori_input_ids[:, :-1] * 100000
+            input_ids[:, 2:] += ori_input_ids[:, :-2] * 100000 * 100000
+            class_pos = torch.arange(sql, device=device).unsqueeze(0).repeat(bsz, 1)[
+                input_ids == class_idx].reshape(bsz, -1)
+            class_poss.append(class_pos)
+        return class_poss, final_pos
+
+    def _forward(self, attn_weights):
+        class_poss, final_pos = self.get_pos(self.input_ids, self.label_id_dict, self.pad_token_id)
+        # device = self.input_ids.device
+        bsz, sql = self.input_ids.shape
+        assert bsz == 1
+        class_poss_flatten = torch.flatten(torch.cat(class_poss, dim=-1))
+        non_label_idxs = set(range(final_pos[0] - 1)) - set(class_poss_flatten.tolist())
+        random_word_idxs = random.sample(non_label_idxs, len(class_poss_flatten))
+
+        for b_idx in range(bsz):
+            for random_word_idx in random_word_idxs:
+                attn_weights[b_idx, :,
+                random_word_idx: random_word_idx + self.window_size + 1,
+                :random_word_idx] = -10000.
+        return attn_weights
+
+
+---
+File: /icl/analysis/compress_time.py
+---
+
+import pickle
+import time
+import warnings
+from dataclasses import dataclass, field
+from functools import partial
+from typing import List
+import os
+from transformers.hf_argparser import HfArgumentParser
+import torch
+import torch.nn.functional as F
+
+from ..lm_apis.lm_api_base import LMForwardAPI
+from ..util_classes.context_solver import ContextSolver
+from ..utils.data_wrapper import wrap_dataset, tokenize_dataset, wrap_dataset_with_instruct, \
+    remove_str_columns
+from ..utils.load_huggingface_dataset import load_huggingface_dataset_train_and_test
+from ..utils.random_utils import set_seed
+from ..utils.other import load_args, set_gpu, sample_two_set_with_shot_per_class
+from transformers import Trainer, TrainingArguments, PreTrainedModel, AutoModelForCausalLM, \
+    AutoTokenizer, DataCollatorWithPadding
+from ..utils.load_local import get_model_layer_num
+from ..util_classes.arg_classes import CompressTimeArgs
+from ..utils.prepare_model_and_tokenizer import load_model_and_tokenizer, get_label_id_dict_for_args
+
+def clip_sample(sample,tokenizer):
+    input_ids = torch.tensor(sample['input_ids'])
+    attention_mask = torch.tensor(sample['attention_mask'])
+    eos_token_id = tokenizer.eos_token_id
+    actual_len = (input_ids!=eos_token_id).sum()
+    input_ids = input_ids[:actual_len]
+    attention_mask = attention_mask[:actual_len]
+    sample['input_ids'] = input_ids.reshape(1,-1)
+    sample['attention_mask'] = attention_mask.reshape(1,-1)
+    return sample
+
+def my_dict_to(d: dict, device):
+    d['input_ids'] = torch.tensor(d['input_ids']).to(device)
+    d['attention_mask'] = torch.tensor(d['attention_mask']).to(device)
+    return d
+
+def time_recorder(fn):
+    def wrapper(*args,**kwargs):
+        start = time.time()
+        res = fn(*args,**kwargs)
+        end = time.time()
+        print(f"{fn.__name__} time: {end-start}")
+        return res, end-start
+    return wrapper
+
+@time_recorder
+def main(model,datas):
+    with torch.no_grad():
+        for data in datas:
+            data = my_dict_to(data,model.device)
+            _ = model(**data)
+
+def compress_time(args: CompressTimeArgs):
+    if os.path.exists(args.save_file_name):
+        return
+    set_gpu(args.gpu)
+    if args.sample_from == 'test':
+        dataset = load_huggingface_dataset_train_and_test(args.task_name)
+    else:
+        raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+    model, tokenizer = load_model_and_tokenizer(args)
+    args.label_id_dict = get_label_id_dict_for_args(args, tokenizer)
+
+    model = LMForwardAPI(model=model, model_name=args.model_name, tokenizer=tokenizer,
+                         device='cuda:0',
+                         label_dict=args.label_dict)
+
+    num_layer = get_model_layer_num(model=model.model, model_name=args.model_name)
+
+    context_solver = ContextSolver(task_name=args.task_name, tokenizer=tokenizer)
+
+    def prepare_analysis_dataset(seed):
+        demonstration, _ = sample_two_set_with_shot_per_class(dataset['train'],
+                                                              args.demonstration_shot,
+                                                              0, seed, label_name='label',
+                                                              a_total_shot=args.demonstration_total_shot)
+        if args.sample_from == 'test':
+            if len(dataset['test']) < args.actual_sample_size:
+                args.actual_sample_size = len(dataset['test'])
+                warnings.warn(
+                    f"sample_size: {args.sample_size} is larger than test set size: {len(dataset['test'])},"
+                    f"actual_sample_size is {args.actual_sample_size}")
+            test_sample = dataset['test'].shuffle(seed=seed).select(range(args.actual_sample_size))
+            demo_dataset = wrap_dataset(test_sample, demonstration, args.label_dict,
+                                        args.task_name)
+            demo_dataset = tokenize_dataset(demo_dataset, tokenizer)
+
+            context = demo_dataset[0]['sentence']
+            instruct = context_solver.get_empty_demo_context(context, only_demo_part=True)
+
+            empty_demo_dataset = wrap_dataset_with_instruct(test_sample, instruct, args.label_dict,
+                                                            args.task_name)
+            empty_demo_dataset = tokenize_dataset(empty_demo_dataset, tokenizer)
+
+            no_demo_dataset = wrap_dataset(test_sample, [], args.label_dict,
+                                           args.task_name)
+            no_demo_dataset = tokenize_dataset(no_demo_dataset, tokenizer)
+        else:
+            raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+        return demo_dataset, empty_demo_dataset, no_demo_dataset
+
+
+    ys = []
+    for seed in args.seeds:
+        analysis_dataset, analysis_empty_demo_dataset, analysis_no_demo_dataset = prepare_analysis_dataset(
+            seed)
+
+        demo_dataset = analysis_dataset.map(partial(clip_sample, tokenizer=tokenizer))
+        no_demo_dataset = analysis_no_demo_dataset.map(partial(clip_sample, tokenizer=tokenizer))
+
+        model.results_args = {'output_hidden_states': True,
+                              'output_attentions': True, 'use_cache': True}
+        data = demo_dataset[0]
+        mask = context_solver.get_mask(data['input_ids'])
+        data = my_dict_to(data, model.device)
+        model.use_past_key_values = False
+        with torch.no_grad():
+            y = model(**data)
+        past_key_values = y['results'].past_key_values
+        past_key_values = tuple(
+            tuple(t[:, :, mask, :] for t in tup) for tup in past_key_values)
+
+        model.use_past_key_values = True
+        model.past_key_values = past_key_values
+        y1 = main(model, no_demo_dataset)
+
+        model.use_past_key_values = False
+        model.past_key_values = None
+        y2 = main(model, demo_dataset)
+
+        ys.append((y1, y2))
+
+    os.makedirs(os.path.dirname(args.save_file_name), exist_ok=True)
+    with open(args.save_file_name, 'wb') as f:
+        pickle.dump(ys, f)
+
+
+
+---
+File: /icl/analysis/compress_top.py
+---
+
+import pickle
+import random
+import warnings
+from dataclasses import dataclass, field
+from typing import List
+import os
+
+import numpy as np
+from transformers.hf_argparser import HfArgumentParser
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import accuracy_score
+from .prefixier import Prefixer
+from ..lm_apis.lm_api_base import LMForwardAPI
+from ..util_classes.context_solver import ContextSolver
+from ..util_classes.predictor_classes import Predictor
+from ..utils.data_wrapper import wrap_dataset, tokenize_dataset, wrap_dataset_with_instruct, \
+    remove_str_columns
+from ..utils.load_huggingface_dataset import load_huggingface_dataset_train_and_test
+from ..utils.random_utils import set_seed
+from ..utils.other import load_args, set_gpu, sample_two_set_with_shot_per_class
+from transformers import Trainer, TrainingArguments, PreTrainedModel, AutoModelForCausalLM, \
+    AutoTokenizer, DataCollatorWithPadding
+from ..utils.load_local import get_model_layer_num
+from ..util_classes.arg_classes import CompressTopArgs
+from ..utils.prepare_model_and_tokenizer import load_model_and_tokenizer, get_label_id_dict_for_args
+
+
+class TruncatingDataCollator(DataCollatorWithPadding):
+    def __init__(self, tokenizer, max_length: int, padding=True, pad_to_multiple_of=None):
+        super().__init__(tokenizer=tokenizer, padding=padding,
+                         pad_to_multiple_of=pad_to_multiple_of)
+        self.max_length = max_length
+
+    def __call__(self, features: List[dict]):
+        batch = super().__call__(features)
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor) and len(value.shape) == 2:
+                batch[key] = value[:, :self.max_length]
+        return batch
+
+def get_label(y):
+    return y.predictions[0].argmax(-1)
+
+def get_logits(y):
+    if y.predictions[2].shape[-1] > 30000:
+        return y.predictions[2]
+    else:
+        return y.predictions[3]
+
+def get_topk(y, k):
+    logits = get_logits(y)
+    indices = np.argpartition(logits, -k,axis=1)[:,-k:]
+    return indices
+
+def jaccard(a,b):
+    scores = []
+    for single_a, single_b in zip(a,b):
+        set_a = set(single_a)
+        set_b = set(single_b)
+        score = len(set_a.intersection(set_b))/len(set_a.union(set_b))
+        scores.append(score)
+    return np.array(scores).mean()
+
+def compress(args: CompressTopArgs):
+    if os.path.exists(args.save_file_name):
+        return
+    # set_gpu(args.gpu)
+    if args.sample_from == 'test':
+        dataset = load_huggingface_dataset_train_and_test(args.task_name)
+    else:
+        raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+    model, tokenizer = load_model_and_tokenizer(args)
+    args.label_id_dict = get_label_id_dict_for_args(args, tokenizer)
+
+    model = LMForwardAPI(model=model, model_name=args.model_name, tokenizer=tokenizer,
+                         device='cuda:0',
+                         label_dict=args.label_dict)
+
+    set_seed(args.seeds[0])
+
+    data_collator = TruncatingDataCollator(
+        tokenizer=tokenizer, pad_to_multiple_of=1, max_length=tokenizer.max_len_single_sentence)
+    training_args = TrainingArguments("./output_dir", remove_unused_columns=False,
+                                      per_gpu_eval_batch_size=args.batch_size,
+                                      per_gpu_train_batch_size=args.batch_size)
+
+    num_layer = get_model_layer_num(model=model.model, model_name=args.model_name)
+    predictor = Predictor(label_id_dict=args.label_id_dict, pad_token_id=tokenizer.pad_token_id,
+                          task_name=args.task_name, tokenizer=tokenizer, layer=num_layer)
+    context_solver = ContextSolver(task_name=args.task_name, tokenizer=tokenizer)
+
+    def prepare_analysis_dataset(seed):
+        demonstration, _ = sample_two_set_with_shot_per_class(dataset['train'],
+                                                              args.demonstration_shot,
+                                                              0, seed, label_name='label',
+                                                              a_total_shot=args.demonstration_total_shot)
+        if args.sample_from == 'test':
+            if len(dataset['test']) < args.actual_sample_size:
+                args.actual_sample_size = len(dataset['test'])
+                warnings.warn(
+                    f"sample_size: {args.sample_size} is larger than test set size: {len(dataset['test'])},"
+                    f"actual_sample_size is {args.actual_sample_size}")
+            test_sample = dataset['test'].shuffle(seed=seed).select(range(args.actual_sample_size))
+            demo_dataset = wrap_dataset(test_sample, demonstration, args.label_dict,
+                                        args.task_name)
+            demo_dataset = tokenize_dataset(demo_dataset, tokenizer)
+
+            context = demo_dataset[0]['sentence']
+            instruct = context_solver.get_empty_demo_context(context, only_demo_part=True)
+
+            empty_demo_dataset = wrap_dataset_with_instruct(test_sample, instruct, args.label_dict,
+                                                            args.task_name)
+            empty_demo_dataset = tokenize_dataset(empty_demo_dataset, tokenizer)
+
+            no_demo_dataset = wrap_dataset(test_sample, [], args.label_dict,
+                                           args.task_name)
+            no_demo_dataset = tokenize_dataset(no_demo_dataset, tokenizer)
+        else:
+            raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+        return demo_dataset, empty_demo_dataset, no_demo_dataset
+
+    results = []
+
+    for seed in args.seeds:
+        analysis_dataset, analysis_empty_demo_dataset, analysis_no_demo_dataset = prepare_analysis_dataset(
+            seed)
+
+        model.use_past_key_values = False
+        model.past_key_values = None
+        model.results_args = {}
+        trainer = Trainer(model=model, args=training_args, data_collator=data_collator)
+        data = remove_str_columns(analysis_dataset)
+        normal_y = trainer.predict(data, ignore_keys=['results'])
+
+
+        model.results_args = {'output_hidden_states': True,
+                              'output_attentions': True, 'use_cache': True}
+        trainer = Trainer(model=model, args=training_args, data_collator=data_collator)
+        data = analysis_dataset.select([0])
+        data = remove_str_columns(data)
+        _ = trainer.predict(data)
+        past_key_values = _.predictions[2].past_key_values
+        past_key_values = tuple(
+            tuple(torch.tensor(t) for t in tup) for tup in past_key_values)
+        mask = context_solver.get_mask(data[0]['input_ids'])
+
+        label_past_key_values = tuple(
+            tuple(t[:, :, mask, :] for t in tup) for tup in past_key_values)
+
+        model.use_past_key_values = True
+        model.past_key_values = label_past_key_values
+        model.results_args = {}
+        model.probs_from_results_fn = None
+
+        offset = torch.where(mask)[0][-1] + 1
+        model.position_offset = offset
+
+        trainer = Trainer(model=model, args=training_args, data_collator=data_collator)
+        n_data = remove_str_columns(analysis_no_demo_dataset)
+        label_y = trainer.predict(n_data, ignore_keys=['results'])
+
+        true_label = n_data['labels']
+        normal_label = get_label(normal_y)
+        l_label = get_label(label_y)
+        wl = jaccard(get_topk(label_y, 5), get_topk(normal_y, 5))
+        ll = accuracy_score(normal_label, l_label)
+        acc = accuracy_score(true_label, l_label)
+
+        os.makedirs(os.path.dirname(args.save_file_name), exist_ok=True)
+        with open(args.save_file_name + 'label', 'w') as f:
+            f.write(f'{wl},{ll},{acc}, label')
+
+        print(f'{wl},{ll},{acc}, label')
+
+        data_collator = TruncatingDataCollator(
+            tokenizer=tokenizer, pad_to_multiple_of=1,
+            max_length=tokenizer.max_len_single_sentence - mask.sum())
+
+        model.use_past_key_values = True
+        model.results_args = {}
+        model.probs_from_results_fn = None
+
+        random_mask = torch.zeros_like(mask)
+        selected_idxs = torch.where(mask)[0]
+        other_idxs = set(list(range(selected_idxs[-1]))) - set(selected_idxs)
+        class_poss, final_pos = predictor.get_pos(
+            {'input_ids': torch.tensor(data[0]['input_ids']).unsqueeze(0)})
+        class_poss = [_.unsqueeze(0) for _ in class_poss]
+        class_poss_flatten = torch.flatten(torch.cat(class_poss, dim=-1)).tolist()
+        class_poss_flatten = sorted(class_poss_flatten)
+
+        single_other_idxs_sets = []
+        for i in range(len(class_poss_flatten)):
+            before_idx = -1 if i == 0 else class_poss_flatten[i - 1]
+            single_other_idxs = [j for j in other_idxs if
+                                 (j > before_idx and j < class_poss_flatten[i])]
+            single_other_idxs = set(single_other_idxs) - set(selected_idxs.tolist())
+            single_other_idxs_sets.append(list(single_other_idxs))
+
+        prod = 1
+        for _ in single_other_idxs_sets:
+            prod *= len(_)
+
+        ks = list(range(prod))
+        random.shuffle(ks)
+
+        if args.ks_num != -1:
+            ks = ks[:args.ks_num]
+
+        for k in ks:
+            single_other_idx_list = []
+            t_k = k
+            for _ in single_other_idxs_sets:
+                cur_i = t_k % len(_)
+                t_k = t_k // len(_)
+                single_other_idx_list.append(_[cur_i])
+
+            new_selected_idxs = list(
+                (set(selected_idxs.tolist()) - set(class_poss_flatten)) | set(single_other_idx_list))
+
+            random_mask[new_selected_idxs] = True
+            random_past_key_values = tuple(
+                tuple(t[:, :, random_mask, :] for t in tup) for tup in past_key_values)
+
+            model.use_past_key_values = True
+            model.past_key_values = random_past_key_values
+            offset = torch.where(mask)[0][-1] + 1
+            model.position_offset = offset
+            trainer = Trainer(model=model, args=training_args, data_collator=data_collator)
+            n_data = remove_str_columns(analysis_no_demo_dataset)
+            compress_y = trainer.predict(n_data, ignore_keys=['results'])
+
+            true_label = n_data['labels']
+            normal_label = get_label(normal_y)
+            compress_label = get_label(compress_y)
+            wl = jaccard(get_topk(compress_y, 5), get_topk(normal_y, 5))
+            ll = accuracy_score(normal_label,compress_label)
+            acc = accuracy_score(true_label,compress_label)
+
+            results.append((wl,ll,acc,k))
+
+            os.makedirs(os.path.dirname(args.save_file_name), exist_ok=True)
+            with open(args.save_file_name + str(k), 'w') as f:
+                f.write(f'{wl},{ll},{acc},{k}')
+
+
+    os.makedirs(os.path.dirname(args.save_file_name), exist_ok=True)
+    with open(args.save_file_name, 'wb') as f:
+        pickle.dump(results, f)
+
+
+
+---
+File: /icl/analysis/compress.py
+---
+
+import pickle
+import random
+import warnings
+from dataclasses import dataclass, field
+from typing import List
+import os
+from transformers.hf_argparser import HfArgumentParser
+import torch
+import torch.nn.functional as F
+
+from ..lm_apis.lm_api_base import LMForwardAPI
+from ..util_classes.context_solver import ContextSolver
+from ..util_classes.predictor_classes import Predictor
+from ..utils.data_wrapper import wrap_dataset, tokenize_dataset, wrap_dataset_with_instruct, \
+    remove_str_columns
+from ..utils.load_huggingface_dataset import load_huggingface_dataset_train_and_test
+from ..utils.random_utils import set_seed
+from ..utils.other import load_args, set_gpu, sample_two_set_with_shot_per_class
+from transformers import Trainer, TrainingArguments, PreTrainedModel, AutoModelForCausalLM, \
+    AutoTokenizer, DataCollatorWithPadding
+from ..utils.load_local import get_model_layer_num
+from ..util_classes.arg_classes import CompressArgs
+from ..utils.prepare_model_and_tokenizer import load_model_and_tokenizer, get_label_id_dict_for_args
+
+
+class TruncatingDataCollator(DataCollatorWithPadding):
+    def __init__(self, tokenizer, max_length: int, padding=True, pad_to_multiple_of=None):
+        super().__init__(tokenizer=tokenizer, padding=padding,
+                         pad_to_multiple_of=pad_to_multiple_of)
+        self.max_length = max_length
+
+    def __call__(self, features: List[dict]):
+        batch = super().__call__(features)
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor) and len(value.shape) == 2:
+                batch[key] = value[:, :self.max_length]
+        return batch
+
+
+def compress(args: CompressArgs):
+    if os.path.exists(args.save_file_name):
+        return
+    set_gpu(args.gpu)
+    if args.sample_from == 'test':
+        dataset = load_huggingface_dataset_train_and_test(args.task_name)
+    else:
+        raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+    model, tokenizer = load_model_and_tokenizer(args)
+    args.label_id_dict = get_label_id_dict_for_args(args, tokenizer)
+
+    model = LMForwardAPI(model=model, model_name=args.model_name, tokenizer=tokenizer,
+                         device='cuda:0',
+                         label_dict=args.label_dict)
+
+    data_collator = TruncatingDataCollator(
+        tokenizer=tokenizer, pad_to_multiple_of=1, max_length=tokenizer.max_len_single_sentence)
+    training_args = TrainingArguments("./output_dir", remove_unused_columns=False,
+                                      per_gpu_eval_batch_size=args.batch_size,
+                                      per_gpu_train_batch_size=args.batch_size)
+
+    num_layer = get_model_layer_num(model=model.model, model_name=args.model_name)
+    predictor = Predictor(label_id_dict=args.label_id_dict, pad_token_id=tokenizer.pad_token_id,
+                          task_name=args.task_name, tokenizer=tokenizer, layer=num_layer)
+    context_solver = ContextSolver(task_name=args.task_name, tokenizer=tokenizer)
+
+    def prepare_analysis_dataset(seed):
+        demonstration, _ = sample_two_set_with_shot_per_class(dataset['train'],
+                                                              args.demonstration_shot,
+                                                              0, seed, label_name='label',
+                                                              a_total_shot=args.demonstration_total_shot)
+        if args.sample_from == 'test':
+            if len(dataset['test']) < args.actual_sample_size:
+                args.actual_sample_size = len(dataset['test'])
+                warnings.warn(
+                    f"sample_size: {args.sample_size} is larger than test set size: {len(dataset['test'])},"
+                    f"actual_sample_size is {args.actual_sample_size}")
+            test_sample = dataset['test'].shuffle(seed=seed).select(range(args.actual_sample_size))
+            demo_dataset = wrap_dataset(test_sample, demonstration, args.label_dict,
+                                        args.task_name)
+            demo_dataset = tokenize_dataset(demo_dataset, tokenizer)
+
+            context = demo_dataset[0]['sentence']
+            instruct = context_solver.get_empty_demo_context(context, only_demo_part=True)
+
+            empty_demo_dataset = wrap_dataset_with_instruct(test_sample, instruct, args.label_dict,
+                                                            args.task_name)
+            empty_demo_dataset = tokenize_dataset(empty_demo_dataset, tokenizer)
+
+            no_demo_dataset = wrap_dataset(test_sample, [], args.label_dict,
+                                           args.task_name)
+            no_demo_dataset = tokenize_dataset(no_demo_dataset, tokenizer)
+        else:
+            raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+        return demo_dataset, empty_demo_dataset, no_demo_dataset
+
+    ys = []
+    for seed in args.seeds:
+        analysis_dataset, analysis_empty_demo_dataset, analysis_no_demo_dataset = prepare_analysis_dataset(
+            seed)
+
+        model.results_args = {'output_hidden_states': True,
+                              'output_attentions': True, 'use_cache': True}
+        trainer = Trainer(model=model, args=training_args, data_collator=data_collator)
+        data = analysis_dataset.select([0])
+        data = remove_str_columns(data)
+        _ = trainer.predict(data)
+        past_key_values = _.predictions[2].past_key_values
+        past_key_values = tuple(
+            tuple(torch.tensor(t) for t in tup) for tup in past_key_values)
+        mask = context_solver.get_mask(data[0]['input_ids'])
+
+        if args.model_name == 'gpt-j-6b':
+            offset = torch.where(mask)[0][-1] + 1
+            model.position_offset = offset
+
+        data_collator = TruncatingDataCollator(
+            tokenizer=tokenizer, pad_to_multiple_of=1,
+            max_length=tokenizer.max_len_single_sentence - mask.sum())
+
+        past_key_values = tuple(
+            tuple(t[:, :, mask, :] for t in tup) for tup in past_key_values)
+
+        model.use_past_key_values = True
+        model.past_key_values = past_key_values
+        model.results_args = {}
+        model.probs_from_results_fn = None
+
+        trainer = Trainer(model=model, args=training_args, data_collator=data_collator)
+        n_data = remove_str_columns(analysis_no_demo_dataset)
+        y1 = trainer.predict(n_data, ignore_keys=['results'])
+
+        model.results_args = {}
+        model.probs_from_results_fn = None
+        past_key_values = _.predictions[2].past_key_values
+        past_key_values = tuple(
+            tuple(torch.tensor(t) for t in tup) for tup in past_key_values)
+        mask = context_solver.get_mask(data[0]['input_ids'])
+        # mask_sum = mask.sum()
+        # random_mask = torch.zeros_like(mask)
+        # indices = torch.randperm(len(mask))[:mask_sum]
+        #
+        # random_mask[indices] = True
+        random_mask = torch.zeros_like(mask)
+        selected_idxs = torch.where(mask)[0]
+        other_idxs = set(list(range(selected_idxs[-1]))) - set(selected_idxs)
+        class_poss, final_pos = predictor.get_pos(
+            {'input_ids': torch.tensor(data[0]['input_ids']).unsqueeze(0)})
+        class_poss = [_.unsqueeze(0) for _ in class_poss]
+        class_poss_flatten = torch.flatten(torch.cat(class_poss, dim=-1)).tolist()
+        # print(class_poss_flatten)
+        class_poss_flatten = sorted(class_poss_flatten)
+        single_other_idx_list = []
+        for i in range(len(class_poss_flatten)):
+            before_idx = -1 if i == 0 else class_poss_flatten[i - 1]
+            single_other_idxs = [j for j in other_idxs if
+                                 (j > before_idx and j < class_poss_flatten[i])]
+            single_other_idxs = set(single_other_idxs) - set(selected_idxs.tolist())
+            single_other_idx = random.sample(single_other_idxs, 1)[0]
+            single_other_idx_list.append(single_other_idx)
+        new_selected_idxs = list(
+            (set(selected_idxs.tolist()) - set(class_poss_flatten)) | set(single_other_idx_list))
+        # print(selected_idxs)
+        # print(new_selected_idxs)
+        random_mask[new_selected_idxs] = True
+        past_key_values = tuple(
+            tuple(t[:, :, random_mask, :] for t in tup) for tup in past_key_values)
+
+        model.use_past_key_values = True
+        model.past_key_values = past_key_values
+
+
+        trainer = Trainer(model=model, args=training_args, data_collator=data_collator)
+        n_data = remove_str_columns(analysis_no_demo_dataset)
+        y4 = trainer.predict(n_data, ignore_keys=['results'])
+
+        model.use_past_key_values = False
+        model.past_key_values = None
+        trainer = Trainer(model=model, args=training_args, data_collator=data_collator)
+        data = remove_str_columns(analysis_dataset)
+        y2 = trainer.predict(data, ignore_keys=['results'])
+
+        model.use_past_key_values = False
+        model.past_key_values = None
+        trainer = Trainer(model=model, args=training_args, data_collator=data_collator)
+        data = remove_str_columns(analysis_empty_demo_dataset)
+        y3 = trainer.predict(data, ignore_keys=['results'])
+
+        ys.append((y1, y2, y3, y4))
+
+    os.makedirs(os.path.dirname(args.save_file_name), exist_ok=True)
+    with open(args.save_file_name, 'wb') as f:
+        pickle.dump(ys, f)
+
+
+
+---
+File: /icl/analysis/deep_layer.py
+---
+
+import pickle
+import warnings
+from dataclasses import dataclass, field
+from typing import List
+import os
+from transformers.hf_argparser import HfArgumentParser
+import torch
+import torch.nn.functional as F
+from ..lm_apis.lm_api_base import LMForwardAPI
+from ..utils.data_wrapper import wrap_dataset, tokenize_dataset
+from ..utils.load_huggingface_dataset import load_huggingface_dataset_train_and_test
+from ..utils.random_utils import set_seed
+from ..utils.other import load_args, set_gpu, sample_two_set_with_shot_per_class
+from transformers import Trainer, TrainingArguments, PreTrainedModel, AutoModelForCausalLM, \
+    AutoTokenizer
+from ..utils.load_local import convert_path_old, load_local_model_or_tokenizer, get_model_layer_num
+from ..util_classes.arg_classes import DeepArgs
+from ..utils.prepare_model_and_tokenizer import load_model_and_tokenizer, get_label_id_dict_for_args
+from ..util_classes.predictor_classes import Predictor
+
+
+
+def deep_layer(args: DeepArgs):
+    if os.path.exists(args.save_file_name):
+        return
+    set_gpu(args.gpu)
+    if args.sample_from == 'test':
+        dataset = load_huggingface_dataset_train_and_test(args.task_name)
+    else:
+        raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+    model, tokenizer = load_model_and_tokenizer(args)
+    args.label_id_dict = get_label_id_dict_for_args(args, tokenizer)
+
+    model = LMForwardAPI(model=model, model_name=args.model_name, tokenizer=tokenizer,
+                         device='cuda:0',
+                         label_dict=args.label_dict)
+
+    training_args = TrainingArguments("./output_dir", remove_unused_columns=False,
+                                      per_gpu_eval_batch_size=args.batch_size,
+                                      per_gpu_train_batch_size=args.batch_size)
+
+    num_layer = get_model_layer_num(model=model.model, model_name=args.model_name)
+    predictor = Predictor(label_id_dict=args.label_id_dict, pad_token_id=tokenizer.pad_token_id,
+                          task_name=args.task_name, tokenizer=tokenizer, layer=num_layer)
+
+    def prepare_analysis_dataset(seed):
+        demonstration, _ = sample_two_set_with_shot_per_class(dataset['train'],
+                                                              args.demonstration_shot,
+                                                              0, seed, label_name='label',
+                                                              a_total_shot=args.demonstration_total_shot)
+        if args.sample_from == 'test':
+            if len(dataset['test']) < args.actual_sample_size:
+                args.actual_sample_size = len(dataset['test'])
+                warnings.warn(
+                    f"sample_size: {args.sample_size} is larger than test set size: {len(dataset['test'])},"
+                    f"actual_sample_size is {args.actual_sample_size}")
+            test_sample = dataset['test'].shuffle(seed=seed).select(range(args.actual_sample_size))
+            analysis_dataset = wrap_dataset(test_sample, demonstration, args.label_dict,
+                                            args.task_name)
+            analysis_dataset = tokenize_dataset(analysis_dataset, tokenizer)
+
+            analysis_no_demo_dataset = wrap_dataset(test_sample, [], args.label_dict,
+                                                    args.task_name)
+            analysis_no_demo_dataset = tokenize_dataset(analysis_no_demo_dataset, tokenizer)
+        else:
+            raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+        return analysis_dataset, analysis_no_demo_dataset
+
+    ys = []
+    no_demo_ys = []
+    for seed in args.seeds:
+        analysis_dataset, analysis_no_demo_dataset = prepare_analysis_dataset(seed)
+
+        model.results_args = {'output_hidden_states': True, 'output_attentions': True}
+        model.probs_from_results_fn = predictor.cal_all_sim_attn
+        trainer = Trainer(model=model, args=training_args)
+
+        y = trainer.predict(analysis_dataset, ignore_keys=['results'])
+        ys.append(y)
+
+        model.results_args = {}
+        model.probs_from_results_fn = None
+        trainer = Trainer(model=model, args=training_args)
+
+        no_demo_y = trainer.predict(analysis_no_demo_dataset, ignore_keys=['results'])
+        no_demo_ys.append(no_demo_y)
+
+    os.makedirs(os.path.dirname(args.save_file_name), exist_ok=True)
+    with open(args.save_file_name, 'wb') as f:
+        pickle.dump([ys, no_demo_ys], f)
+
+
+
+---
+File: /icl/analysis/n_classification.py
+---
+
+import pickle
+import warnings
+from dataclasses import dataclass, field
+from typing import List
+import os
+from transformers.hf_argparser import HfArgumentParser
+import torch
+import torch.nn.functional as F
+
+from ..lm_apis.lm_api_base import LMForwardAPI
+from ..utils.data_wrapper import wrap_dataset, tokenize_dataset
+from ..utils.load_huggingface_dataset import load_huggingface_dataset_train_and_test
+from ..utils.random_utils import set_seed
+from ..utils.other import load_args, set_gpu, sample_two_set_with_shot_per_class
+from transformers import Trainer, TrainingArguments, PreTrainedModel, AutoModelForCausalLM, \
+    AutoTokenizer
+from ..utils.load_local import convert_path_old, load_local_model_or_tokenizer, get_model_layer_num
+from ..util_classes.arg_classes import NClassificationArgs
+from ..utils.prepare_model_and_tokenizer import load_model_and_tokenizer, get_label_id_dict_for_args
+from ..util_classes.predictor_classes import Predictor
+
+
+
+def n_classify(args: NClassificationArgs):
+    if os.path.exists(args.save_file_name):
+        return
+    set_gpu(args.gpu)
+    if args.sample_from == 'test':
+        dataset = load_huggingface_dataset_train_and_test(args.task_name)
+    else:
+        raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+    model, tokenizer = load_model_and_tokenizer(args)
+    args.label_id_dict = get_label_id_dict_for_args(args, tokenizer)
+
+    model = LMForwardAPI(model=model, model_name=args.model_name, tokenizer=tokenizer,
+                         device='cuda:0',
+                         label_dict=args.label_dict)
+
+    training_args = TrainingArguments("./output_dir", remove_unused_columns=False,
+                                      per_gpu_eval_batch_size=args.batch_size,
+                                      per_gpu_train_batch_size=args.batch_size)
+
+    num_layer = get_model_layer_num(model=model.model, model_name=args.model_name)
+
+    def prepare_analysis_dataset(seed):
+        demonstration, _ = sample_two_set_with_shot_per_class(dataset['train'],
+                                                                          args.demonstration_shot,
+                                                                          0,
+                                                                          seed,
+                                                                          label_name='label',
+                                                                          a_total_shot=args.demonstration_total_shot)
+        demonstration = demonstration.shuffle()
+        if args.sample_from == 'test':
+            if len(dataset['test']) < args.actual_sample_size:
+                args.actual_sample_size = len(dataset['test'])
+                warnings.warn(
+                    f"sample_size: {args.sample_size} is larger than test set size: {len(dataset['test'])},"
+                    f"actual_sample_size is {args.actual_sample_size}")
+            test_sample = dataset['test'].shuffle(seed=seed).select(range(args.actual_sample_size))
+            analysis_dataset = wrap_dataset(test_sample, demonstration, args.label_dict,
+                                            args.task_name)
+            analysis_dataset = tokenize_dataset(analysis_dataset, tokenizer)
+
+
+        else:
+            raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+        return analysis_dataset, demonstration
+
+    ys = []
+    for seed in args.seeds:
+        analysis_dataset, demonstration = prepare_analysis_dataset(seed)
+
+        trainer = Trainer(model=model, args=training_args)
+        y = trainer.predict(analysis_dataset, ignore_keys=['results'])
+
+        ys.append((y,))
+
+    os.makedirs(os.path.dirname(args.save_file_name), exist_ok=True)
+    with open(args.save_file_name, 'wb') as f:
+        pickle.dump([ys, ], f)
+
+
+
+---
+File: /icl/analysis/numpy_writer.py
+---
+
+import os
+
+import numpy as np
+
+_numpy_writer_debug = False
+
+def set_writer_np(writer_np):
+    global _writer_np
+    _writer_np = writer_np
+
+def get_writer_np():
+    return _writer_np
+
+def set_numpy_writer_debug(value):
+    global _numpy_writer_debug
+    _numpy_writer_debug = value
+
+def get_numpy_writer_debug():
+    return _numpy_writer_debug
+
+def debug_fn(func):
+    def wrapper(*args, **kwargs):
+        if get_numpy_writer_debug():
+            return func(*args, **kwargs)
+        else:
+            return None
+    return wrapper
+
+
+debug_print = debug_fn(print)
+
+class NumpyWriter:
+    def __init__(self, log_dir, mode = 'w', cover = False):
+        '''
+        mode:   'w' for write
+                'a' for append (for case you run half of the experiment and want to continue) 
+                'r' for read
+        cover: if True, remove the log_dir if it exists
+        '''
+        assert mode in ['w', 'a', 'r'], f"mode {mode} not allowed"
+        self.log_dir = log_dir
+        assert not (mode == 'r' and cover), "mode == 'r' and cover == True not allowed"
+        if not cover and mode == 'w':
+            assert not os.path.exists(log_dir), f"log_dir {log_dir} ({os.path.abspath(log_dir)}) already exists"
+        if cover:
+            if os.path.exists(log_dir):
+                import shutil
+                shutil.rmtree(log_dir)
+                print(f"remove {log_dir}")
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+
+        self.mode = mode
+        self.cover = cover
+
+    
+    def fps(self, name, mode):
+        # here we only use 'a' and 'r', since activation for different samples should all be saved
+        if mode == 'r' and self.mode in ['w','a']:
+            raise RuntimeError(f"You are use a writer to read")
+        if mode == 'a' and self.mode == 'r':
+            raise RuntimeError(f"You are use a reader to write")
+        if mode == 'a':
+            return open(os.path.join(self.log_dir, name), "ab")
+        elif mode == 'r':
+            return open(os.path.join(self.log_dir, name), "rb")
+        else:
+            raise RuntimeError(f"mode {mode} not allowed")
+
+    def append_tensor(self, tensor, fp, debug=False):
+        tensor_numpy = tensor.numpy() if not isinstance(tensor, np.ndarray) else tensor
+        np.save(fp, np.array(tensor_numpy.shape))
+        # 保存 tensor 数据
+        np.save(fp, tensor_numpy)
+
+        debug_print(
+            f"append_tensor {tensor.shape} {tensor.dtype} {tensor_numpy.shape} {tensor_numpy.dtype}", flush=True)
+
+    def read_tensors(self, fp, idxs=None, condition=None):
+        assert not (
+            idxs is not None and condition is not None), "idxs 和 condition 不能同时设置"
+        if idxs is not None:
+            def condition(idx): return idx in idxs
+        elif condition is None:
+            def condition(idx): return True
+        tensors = []
+        idx = 0
+        while True:
+            try:
+                # 读取形状信息
+                shape = np.load(fp, allow_pickle=True)
+                # 读取 tensor 数据
+                tensor = np.load(fp, allow_pickle=True).reshape(shape)
+                if condition(idx):
+                    tensors.append(tensor)
+                idx += 1
+            except Exception as e:
+                # Check if the cause of the UnpicklingError is an EOFError
+                if isinstance(e.__cause__, EOFError):
+                    break
+                else:
+                    raise
+        return tensors
+
+    def write(self, data, name, global_step=None, multiple_tensors=True, debug=False):
+        with self.fps(name,mode='a') as fp:
+            if multiple_tensors:
+                for tensor in data:
+                    self.append_tensor(tensor, fp, debug=debug)
+            else:
+                self.append_tensor(data, fp, debug=debug)
+        debug_print(f"write {name}", flush=True)
+
+    def read(self, name, idxs=None, condition=None):
+        with self.fps(name,mode='r') as fp:
+            return self.read_tensors(fp, idxs=idxs, condition=condition)
+
+class CPUTensorBuffer(list):
+    def __init__(self, tensors, cpu_buffer=100, allow_auto_write=True, writer_np=None, name=None):
+        super().__init__(tensors)
+        self.cpu_buffer_nbytes = cpu_buffer * 1024 * 1024
+        self.mem = 0
+        for tensor in self:
+            self.mem += tensor.nbytes
+        self.allow_auto_write = allow_auto_write
+        self.writer_np = writer_np
+        self.name = name
+        if self.allow_auto_write:
+            assert self.writer_np is not None, "writer_np must be set when allow_auto_write is True"
+            assert self.name is not None, "name must be set when allow_auto_write is True"
+
+    def clear(self) -> None:
+        self.mem = 0
+        # 没想好要不要手动删tensor（已经放到cpu上了）
+        return super().clear()
+
+    def _write(self):
+        self.writer_np.write(self, self.name, multiple_tensors=True)
+        self.clear()
+
+    def auto_check_write(func):
+        def wrapper(self, *args, **kwargs):
+            if self.allow_auto_write:
+                if self.mem >= self.cpu_buffer_nbytes:
+                    self._write()
+            return func(self, *args, **kwargs)
+        return wrapper
+
+    @auto_check_write
+    def append(self, __object) -> None:
+        self.mem += __object.nbytes
+        return super().append(__object)
+
+    @auto_check_write
+    def extend(self, __iterable) -> None:
+        for obj in __iterable:
+            self.mem += obj.nbytes
+        return super().extend(__iterable)
+
+
+class CPUTensorBufferDict(dict):
+    def __init__(self, writer_np):
+        super().__init__()
+        assert isinstance(writer_np, NumpyWriter)
+        self.writer_np = writer_np
+
+    # 暂时应该保证所有的CPUTensorBuffer.writer_np都和__init__里的writer_np一样
+    def __missing__(self, key):
+        default_value = CPUTensorBuffer(
+            [], allow_auto_write=True, cpu_buffer=100,  writer_np=self.writer_np, name=key)
+        self[key] = default_value
+        return default_value
+
+
+
+---
+File: /icl/analysis/qkv_getter.py
+---
+
+import warnings
+from typing import Callable, Optional, List, Union
+from functools import wraps, partial
+
+import numpy as np
+import torch
+from datasets import concatenate_datasets
+from torch import nn
+from torch.nn import functional as F
+from transformers import PreTrainedModel, DataCollatorWithPadding, Trainer
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
+
+from ..util_classes.predictor_classes import Predictor
+from ..util_classes.setter_with_restore import SetterWithRestore
+from ..lm_apis.lm_api_base import LMForwardAPI
+from ..utils.data_wrapper import wrap_dataset, tokenize_dataset, remove_str_columns
+from ..utils.other import sample_two_set_with_shot_per_class
+
+
+class QKVGetter:
+    def __init__(self):
+        self.q = None
+        self.k = None
+        self.v = None
+
+    def register_qkv(self, q, k, v):
+        self.q = q
+        self.k = k
+        self.v = v
+
+
+def wrap_fn_save_query_key_value(qkvgetter: QKVGetter):
+    def decorator(func):
+        def wrapper(query, key, value, attention_mask=None, head_mask=None):
+            qkvgetter.register_qkv(query, key, value)
+            return func(query, key, value, attention_mask=attention_mask, head_mask=head_mask)
+
+        return wrapper
+
+    return decorator
+
+
+class QKVGetterManger:
+    def __init__(self, model: LMForwardAPI, predictor: Predictor):
+        self.model = model
+        self.qkv = None
+        self.setter_with_restore = SetterWithRestore()
+        self.qkvgetters = self.register_qkvgetter_to_model()
+        self.setter_with_restore.set(self.model.forward,
+                                     manager_decoractor(self)(self.model.forward))
+        self.predictor = predictor
+
+    @property
+    def input_ids(self):
+        return self._input_ids
+
+    @input_ids.setter
+    def input_ids(self, input_ids):
+        self._input_ids = input_ids
+
+    def register_input_ids(self, input_ids):
+        self.input_ids = input_ids
+
+    def register_qkvgetter_to_model(self):
+        qkvgetters = []
+        if self.model.model_name in ['gpt2-xl','gpt-j-6b']:
+            for i, layer in enumerate(self.model.model.transformer.h):
+                qkvgetter = QKVGetter()
+                qkvgetters.append(qkvgetter)
+                wrapped_attn = wrap_fn_save_query_key_value(qkvgetter=qkvgetter)(
+                    layer.attn._attn)
+                self.setter_with_restore.set(layer.attn._attn, wrapped_attn)
+        else:
+            raise NotImplementedError(f'{self.model.model_name} not supported yet')
+        return qkvgetters
+
+    def unregister(self):
+        self.setter_with_restore.restore_all()
+
+    def collect_qkv(self):
+        qkv = []
+        for qkvgetter in self.qkvgetters:
+            qkv.append((qkvgetter.q, qkvgetter.k, qkvgetter.v))
+        inputs = {'input_ids': self.input_ids}
+        qkv = self.predictor._cal_all_key_and_values_of_class(inputs=inputs, past_key_values=qkv,
+                                                              one_class_one_list=True,
+                                                              include_final=True)
+        return qkv
+
+
+def manager_decoractor(manager: QKVGetterManger):
+    def model_forward_decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            input_ids = kwargs.get('input_ids', None)
+            if input_ids is None:
+                input_ids = args[0]
+            manager.register_input_ids(input_ids)
+            results = fn(*args, **kwargs)
+            assert 'qkv' not in results
+            results['qkv'] = manager.collect_qkv()
+            return results
+
+        return wrapper
+
+    return model_forward_decorator
+
+
+def prepare_analysis_dataset(demonstration, args, seed, dataset, tokenizer):
+    if args.sample_from == 'test':
+        if len(dataset['test']) < args.actual_sample_size:
+            args.actual_sample_size = len(dataset['test'])
+            warnings.warn(
+                f"sample_size: {args.sample_size} is larger than test set size: {len(dataset['test'])},"
+                f"actual_sample_size is {args.actual_sample_size}")
+        test_sample = dataset['test'].shuffle(seed=seed).select(range(args.actual_sample_size))
+        demo_dataset = wrap_dataset(test_sample, demonstration, args.label_dict,
+                                    args.task_name)
+        demo_dataset = tokenize_dataset(demo_dataset, tokenizer)
+    else:
+        raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+    return demo_dataset
+
+def softmax(x, axis=-1):
+    x = x - np.max(x, axis=axis, keepdims=True)
+    x = np.exp(x)
+    return x / np.sum(x, axis=axis, keepdims=True)
+
+
+def cal_results(demonstraions, model, tokenizer, training_args, args, seed, dataset):
+    data_collator = DataCollatorWithPadding(
+        tokenizer=tokenizer, pad_to_multiple_of=1, max_length=1024)
+    trainer = Trainer(model=model, args=training_args, data_collator=data_collator)
+    demo_dataset, empty_test_dataset = prepare_analysis_dataset(demonstraions, args, seed, dataset,
+                                                                tokenizer)
+    demo_dataset = remove_str_columns(demo_dataset)
+    demo_y = trainer.predict(demo_dataset, ignore_keys=['results'])
+    labels = np.array(demo_dataset['label'])
+    pred_label = demo_y.predictions[0].argmax(-1)
+    return labels, pred_label
+
+
+
+
+---
+File: /icl/analysis/reweighting.py
+---
+
+import pickle
+import warnings
+from dataclasses import dataclass, field
+from typing import List
+import os
+
+from torch.optim import Adam
+from tqdm import tqdm
+from transformers.hf_argparser import HfArgumentParser
+import torch
+import torch.nn.functional as F
+from ..lm_apis.lm_api_base import LMForwardAPI
+from ..utils.data_wrapper import wrap_dataset, tokenize_dataset
+from ..utils.load_huggingface_dataset import load_huggingface_dataset_train_and_test
+from ..utils.random_utils import set_seed
+from ..utils.other import load_args, set_gpu, sample_two_set_with_shot_per_class, dict_to
+from transformers import Trainer, TrainingArguments, PreTrainedModel, AutoModelForCausalLM, \
+    AutoTokenizer
+from ..utils.load_local import convert_path_old, load_local_model_or_tokenizer, get_model_layer_num
+from ..util_classes.arg_classes import ReweightingArgs
+from ..utils.prepare_model_and_tokenizer import load_model_and_tokenizer, get_label_id_dict_for_args
+from ..util_classes.predictor_classes import Predictor
+from .attentioner_for_train import AttentionAdapter,  \
+    GPT2AttentionerManager
+from datasets import concatenate_datasets
+from copy import deepcopy
+
+
+def train(args: ReweightingArgs):
+    if os.path.exists(args.save_file_name):
+        return
+    set_gpu(args.gpu)
+    if args.sample_from == 'test':
+        dataset = load_huggingface_dataset_train_and_test(args.task_name)
+    else:
+        raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+    model, tokenizer = load_model_and_tokenizer(args)
+    args.label_id_dict = get_label_id_dict_for_args(args, tokenizer)
+
+    model = LMForwardAPI(model=model, model_name=args.model_name, tokenizer=tokenizer,
+                         device='cuda:0',
+                         label_dict=args.label_dict)
+
+    training_args = TrainingArguments("./output_dir", remove_unused_columns=False,
+                                      per_gpu_eval_batch_size=args.batch_size,
+                                      per_gpu_train_batch_size=args.batch_size)
+
+    def prepare_analysis_dataset(seed):
+        demonstration, train_samples = sample_two_set_with_shot_per_class(dataset['train'],
+                                                                          args.demonstration_shot,
+                                                                          args.train_num_per_class,
+                                                                          seed,
+                                                                          label_name='label',
+                                                                          a_total_shot=args.demonstration_total_shot)
+        if args.sample_from == 'test':
+            if len(dataset['test']) < args.actual_sample_size:
+                args.actual_sample_size = len(dataset['test'])
+                warnings.warn(
+                    f"sample_size: {args.sample_size} is larger than test set size: {len(dataset['test'])},"
+                    f"actual_sample_size is {args.actual_sample_size}")
+            test_sample = dataset['test'].shuffle(seed=seed).select(range(args.actual_sample_size))
+            analysis_dataset = wrap_dataset(test_sample, demonstration, args.label_dict,
+                                            args.task_name)
+            analysis_dataset = tokenize_dataset(analysis_dataset, tokenizer)
+
+            train_dataset = wrap_dataset(train_samples, demonstration, args.label_dict,
+                                         args.task_name)
+            train_dataset = tokenize_dataset(train_dataset, tokenizer)
+        else:
+            raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+        return analysis_dataset, train_dataset, demonstration
+
+    ys = []
+    for seed in args.seeds:
+        analysis_dataset, train_dataset, demonstration = prepare_analysis_dataset(
+            seed)
+
+        training_args = TrainingArguments("./output_dir", remove_unused_columns=False,
+                                          per_gpu_eval_batch_size=1,
+                                          per_gpu_train_batch_size=1)
+        trainer = Trainer(model=model, args=training_args)
+
+        num_layer = get_model_layer_num(model=model.model, model_name=args.model_name)
+        predictor = Predictor(label_id_dict=args.label_id_dict, pad_token_id=tokenizer.pad_token_id,
+                              task_name=args.task_name, tokenizer=tokenizer, layer=num_layer)
+        if args.model_name in ['gpt2-xl']:
+            attentionermanger = GPT2AttentionerManager(model.model, len(demonstration),
+                                                       predictor=predictor,
+                                                       device=model.device, n_head = args.n_head)
+        else:
+            raise NotImplementedError(f"model_name: {args.model_name}")
+
+        params = attentionermanger.params()
+        optimizer = Adam(params, lr=args.lr)
+
+        set_seed(seed)
+        loss_list = []
+        for epoch in tqdm(range(args.epoch_num)):
+            loss_item = 0.
+            train_dataset = train_dataset.shuffle()
+            train_dataloader = trainer.get_eval_dataloader(train_dataset)
+            for idx, data in enumerate(train_dataloader):
+                data = dict_to(data, model.device)
+                output = model(**data)
+                label = data['labels']
+                loss = F.cross_entropy(output['logits'], label)
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                loss_item += loss.item()
+            loss_list.append(loss_item / idx)
+            average_loss = float(loss_item / idx)
+            print(f'{average_loss}/{epoch}')
+
+        y = trainer.predict(analysis_dataset, ignore_keys=['results'])
+
+        for _ in attentionermanger.attention_adapters:
+            _.use_flag = False
+        y2 = trainer.predict(analysis_dataset, ignore_keys=['results'])
+
+        ys.append((y,loss_list, params, y2, average_loss))
+
+    os.makedirs(os.path.dirname(args.save_file_name), exist_ok=True)
+    with open(args.save_file_name, 'wb') as f:
+        pickle.dump([ys, ], f)
+
+
+
+---
+File: /icl/analysis/shallow_layer_non_label.py
+---
+
+import pickle
+import warnings
+from dataclasses import dataclass, field
+from typing import List
+import os
+from transformers.hf_argparser import HfArgumentParser
+import torch
+import torch.nn.functional as F
+
+from .attentioner import AttentionAdapterNonLabel, GPTJAttentionerManager, GPT2AttentionerManager
+from ..lm_apis.lm_api_base import LMForwardAPI
+from ..utils.data_wrapper import wrap_dataset, tokenize_dataset
+from ..utils.load_huggingface_dataset import load_huggingface_dataset_train_and_test
+from ..utils.prepare_model_and_tokenizer import load_model_and_tokenizer, get_label_id_dict_for_args
+from ..utils.random_utils import set_seed
+from ..utils.other import load_args, set_gpu, sample_two_set_with_shot_per_class
+from transformers import Trainer, TrainingArguments, PreTrainedModel, AutoModelForCausalLM, \
+    AutoTokenizer
+from ..utils.load_local import convert_path_old, load_local_model_or_tokenizer, get_model_layer_num
+from ..util_classes.arg_classes import ShallowNonLabelArgs
+from ..util_classes.predictor_classes import Predictor
+
+
+def shallow_layer_non_label(args: ShallowNonLabelArgs):
+    if os.path.exists(args.save_file_name):
+        print('Skip')
+        return
+    set_gpu(args.gpu)
+    if args.sample_from == 'test':
+        dataset = load_huggingface_dataset_train_and_test(args.task_name)
+    else:
+        raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+    model, tokenizer = load_model_and_tokenizer(args)
+    args.label_id_dict = get_label_id_dict_for_args(args, tokenizer)
+
+    model = LMForwardAPI(model=model, model_name=args.model_name, tokenizer=tokenizer,
+                         device='cuda:0',
+                         label_dict=args.label_dict)
+
+    training_args = TrainingArguments("./output_dir", remove_unused_columns=False,
+                                      per_gpu_eval_batch_size=args.batch_size,
+                                      per_gpu_train_batch_size=args.batch_size)
+
+    num_layer = get_model_layer_num(model=model.model, model_name=args.model_name)
+    predictor = Predictor(label_id_dict=args.label_id_dict, pad_token_id=tokenizer.pad_token_id,
+                          task_name=args.task_name, tokenizer=tokenizer, layer=num_layer)
+
+    attention_adapters = [
+        AttentionAdapterNonLabel(label_id_dict=args.label_id_dict, pad_token_id=tokenizer.pad_token_id,
+                                 task_name=args.task_name, tokenizer=tokenizer, window_size=0) for i in
+        range(num_layer)]
+    if args.model_name in ['gpt-j-6b']:
+        attentionermanger = GPTJAttentionerManager(model.model, attention_adapters)
+    elif args.model_name in ['gpt2-xl']:
+        attentionermanger = GPT2AttentionerManager(model.model, attention_adapters)
+    else:
+        raise NotImplementedError(f"model_name: {args.model_name}")
+
+    def prepare_analysis_dataset(seed):
+        demonstration, _ = sample_two_set_with_shot_per_class(dataset['train'],
+                                                              args.demonstration_shot,
+                                                              0, seed, label_name='label',
+                                                              a_total_shot=args.demonstration_total_shot)
+        if args.sample_from == 'test':
+            if len(dataset['test']) < args.actual_sample_size:
+                args.actual_sample_size = len(dataset['test'])
+                warnings.warn(
+                    f"sample_size: {args.sample_size} is larger than test set size: {len(dataset['test'])},"
+                    f"actual_sample_size is {args.actual_sample_size}")
+            test_sample = dataset['test'].shuffle(seed=seed).select(range(args.actual_sample_size))
+            analysis_dataset = wrap_dataset(test_sample, demonstration, args.label_dict,
+                                            args.task_name)
+            analysis_dataset = tokenize_dataset(analysis_dataset, tokenizer)
+
+            analysis_no_demo_dataset = wrap_dataset(test_sample, [], args.label_dict,
+                                                    args.task_name)
+            analysis_no_demo_dataset = tokenize_dataset(analysis_no_demo_dataset, tokenizer)
+        else:
+            raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+        return analysis_dataset, analysis_no_demo_dataset
+
+    ys = []
+    no_demo_ys = []
+    for seed in args.seeds:
+        analysis_dataset, analysis_no_demo_dataset = prepare_analysis_dataset(seed)
+
+        model.results_args = {'output_hidden_states': True, 'output_attentions': True}
+        model.probs_from_results_fn = predictor.cal_all_sim_attn
+        if args.mask_layer_pos == 'first':
+            attentionermanger.set_attentioner_state(True, list(range(0, args.mask_layer_num)))
+        elif args.mask_layer_pos == 'last':
+            attentionermanger.set_attentioner_state(True,
+                                                    list(range(num_layer - args.mask_layer_num,
+                                                               num_layer)))
+        else:
+            raise NotImplementedError(f"mask_layer_pos: {args.mask_layer_pos}")
+        trainer = Trainer(model=model, args=training_args)
+
+        y = trainer.predict(analysis_dataset, ignore_keys=['results'])
+        ys.append(y)
+
+
+    os.makedirs(os.path.dirname(args.save_file_name), exist_ok=True)
+    with open(args.save_file_name, 'wb') as f:
+        pickle.dump([ys, no_demo_ys], f)
+
+
+
+---
+File: /icl/analysis/shallow_layer.py
+---
+
+import pickle
+import warnings
+from dataclasses import dataclass, field
+from typing import List
+import os
+from transformers.hf_argparser import HfArgumentParser
+import torch
+import torch.nn.functional as F
+
+from .attentioner import AttentionAdapter, GPTJAttentionerManager, GPT2AttentionerManager
+from ..lm_apis.lm_api_base import LMForwardAPI
+from ..utils.data_wrapper import wrap_dataset, tokenize_dataset
+from ..utils.load_huggingface_dataset import load_huggingface_dataset_train_and_test
+from ..utils.prepare_model_and_tokenizer import load_model_and_tokenizer, get_label_id_dict_for_args
+from ..utils.random_utils import set_seed
+from ..utils.other import load_args, set_gpu, sample_two_set_with_shot_per_class
+from transformers import Trainer, TrainingArguments, PreTrainedModel, AutoModelForCausalLM, \
+    AutoTokenizer
+from ..utils.load_local import convert_path_old, load_local_model_or_tokenizer, get_model_layer_num
+from ..util_classes.arg_classes import ShallowArgs
+from ..util_classes.predictor_classes import Predictor
+
+
+def shallow_layer(args: ShallowArgs):
+    if os.path.exists(args.save_file_name):
+        print('Skip')
+        return
+    set_gpu(args.gpu)
+    if args.sample_from == 'test':
+        dataset = load_huggingface_dataset_train_and_test(args.task_name)
+    else:
+        raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+    model, tokenizer = load_model_and_tokenizer(args)
+    args.label_id_dict = get_label_id_dict_for_args(args, tokenizer)
+
+    model = LMForwardAPI(model=model, model_name=args.model_name, tokenizer=tokenizer,
+                         device='cuda:0',
+                         label_dict=args.label_dict)
+
+    training_args = TrainingArguments("./output_dir", remove_unused_columns=False,
+                                      per_gpu_eval_batch_size=args.batch_size,
+                                      per_gpu_train_batch_size=args.batch_size)
+
+    num_layer = get_model_layer_num(model=model.model, model_name=args.model_name)
+    predictor = Predictor(label_id_dict=args.label_id_dict, pad_token_id=tokenizer.pad_token_id,
+                          task_name=args.task_name, tokenizer=tokenizer, layer=num_layer)
+
+    attention_adapters = [
+        AttentionAdapter(label_id_dict=args.label_id_dict, pad_token_id=tokenizer.pad_token_id,
+                         task_name=args.task_name, tokenizer=tokenizer, window_size=0) for i in
+        range(num_layer)]
+    if args.model_name in ['gpt-j-6b']:
+        attentionermanger = GPTJAttentionerManager(model.model, attention_adapters)
+    elif args.model_name in ['gpt2-xl']:
+        attentionermanger = GPT2AttentionerManager(model.model, attention_adapters)
+    else:
+        raise NotImplementedError(f"model_name: {args.model_name}")
+
+    def prepare_analysis_dataset(seed):
+        demonstration, _ = sample_two_set_with_shot_per_class(dataset['train'],
+                                                              args.demonstration_shot,
+                                                              0, seed, label_name='label',
+                                                              a_total_shot=args.demonstration_total_shot)
+        if args.sample_from == 'test':
+            if len(dataset['test']) < args.actual_sample_size:
+                args.actual_sample_size = len(dataset['test'])
+                warnings.warn(
+                    f"sample_size: {args.sample_size} is larger than test set size: {len(dataset['test'])},"
+                    f"actual_sample_size is {args.actual_sample_size}")
+            test_sample = dataset['test'].shuffle(seed=seed).select(range(args.actual_sample_size))
+            analysis_dataset = wrap_dataset(test_sample, demonstration, args.label_dict,
+                                            args.task_name)
+            analysis_dataset = tokenize_dataset(analysis_dataset, tokenizer)
+
+            analysis_no_demo_dataset = wrap_dataset(test_sample, [], args.label_dict,
+                                                    args.task_name)
+            analysis_no_demo_dataset = tokenize_dataset(analysis_no_demo_dataset, tokenizer)
+        else:
+            raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+        return analysis_dataset, analysis_no_demo_dataset
+
+    ys = []
+    for seed in args.seeds:
+        analysis_dataset, analysis_no_demo_dataset = prepare_analysis_dataset(seed)
+
+        model.results_args = {'output_hidden_states': True, 'output_attentions': True}
+        model.probs_from_results_fn = predictor.cal_all_sim_attn
+        if args.mask_layer_pos == 'first':
+            attentionermanger.set_attentioner_state(True, list(range(0, args.mask_layer_num)))
+        elif args.mask_layer_pos == 'last':
+            attentionermanger.set_attentioner_state(True,
+                                                    list(range(num_layer - args.mask_layer_num,
+                                                               num_layer)))
+        else:
+            raise NotImplementedError(f"mask_layer_pos: {args.mask_layer_pos}")
+        trainer = Trainer(model=model, args=training_args)
+
+        y = trainer.predict(analysis_dataset, ignore_keys=['results'])
+        ys.append(y)
+
+
+    os.makedirs(os.path.dirname(args.save_file_name), exist_ok=True)
+    with open(args.save_file_name, 'wb') as f:
+        pickle.dump([ys, ], f)
+
+
+
+---
+File: /icl/lm_apis/__init__.py
+---
+
+
+
+
+---
+File: /icl/lm_apis/lm_api_base.py
+---
+
+from typing import Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from icl.utils.other import dict_to
+
+
+class LMForwardAPI(nn.Module):
+    def __init__(self, model, model_name, tokenizer, label_dict: Dict[int, str], device='cuda:0'):
+        super().__init__()
+        self._use_past_key_values = False
+        self._past_key_values = None
+        self.model = model
+        self.model_name = model_name
+        self.tokenizer = tokenizer
+        self.device = device
+        self.model.eval()
+        self.calibration_probs = None
+        self.use_calibration_probs = False
+        self.probs_from_results_fn = None
+        self.results_args: dict = {}
+        self.label_map = {tokenizer.encode(v, add_special_tokens=False)[0]: k for k, v in
+                          label_dict.items()}
+        self.position_offset = 0
+
+        assert model_name in ['gpt2-xl', 'gpt-j-6b']
+
+    @property
+    def device(self):
+        return self.model.device
+
+    @device.setter
+    def device(self, device):
+        print(f'LMForwardAPI: set device to {device}')
+        self.model = self.model.to(device)
+        if self.past_key_values:
+            self.past_key_values = self.past_key_values  # will reset device
+
+    def cal_logits(self, inputs, **kwargs):
+        self.model.eval()
+        inputs = dict_to(inputs, self.device)
+
+        if self.use_past_key_values:
+            past_key_values = self.get_past_key_values(inputs)
+            kwargs['past_key_values'] = past_key_values
+            inputs['attention_mask'] = self.get_mask_with_past_key_values(inputs['attention_mask'])
+            if self.model_name in ['gpt-j-6b','gpt2-xl']:
+                bsz, sql = inputs['input_ids'].shape
+                position_ids = torch.arange(sql, dtype=torch.long, device=self.device).repeat(bsz, 1)
+                position_ids = position_ids + self.position_offset
+                kwargs['position_ids'] = position_ids
+
+        results = self.model(
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask'],
+            **kwargs,
+        )
+        logits = results['logits']
+        # find last position before pad tokens
+        input_ids = inputs['input_ids']
+        eos_token_id: int = self.tokenizer.eos_token_id
+        is_not_eos = input_ids != eos_token_id
+        prediction_pos = is_not_eos.sum(dim=1) - 1
+        is_not_eos = is_not_eos.float()
+        # check all eos_tokens are at the end
+        assert (is_not_eos[:, :-1] - is_not_eos[:, 1:] >= 0).all()
+        # get logits for the last position
+        logits = logits[torch.arange(input_ids.shape[0]), prediction_pos, :]
+        return logits, results
+
+    def _cal_probs(self, logits):
+        interest_index = list(self.label_map.keys())
+        logits = logits[:, interest_index]
+        probs = F.softmax(logits, dim=-1)
+        if self.use_calibration_probs:
+            assert self.calibration_probs is not None
+            probs = probs / self.calibration_probs
+        return probs, logits
+
+    def cal_probs(self, inputs, **kwargs):
+        logits, results = self.cal_logits(inputs, **kwargs)
+        probs, logits = self._cal_probs(logits)
+        return probs, logits, results
+
+    def cal_probs_from_results(self, inputs, results):
+        return self.probs_from_results_fn(inputs, results)
+
+    @property
+    def past_key_values(self):
+        return self._past_key_values
+
+    @past_key_values.setter
+    def past_key_values(self, past_key_values):
+        if past_key_values is not None:
+            assert isinstance(past_key_values, tuple)
+            assert isinstance(past_key_values[0], tuple)
+            assert len(past_key_values[0]) == 2
+            assert isinstance(past_key_values[0][0], torch.Tensor)
+            assert past_key_values[0][0].shape[0] == 1
+            self._past_key_values = tuple(
+                tuple(t.to(self.device) for t in tup) for tup in past_key_values)
+        else:
+            self._past_key_values = None
+
+    @property
+    def use_past_key_values(self):
+        return self._use_past_key_values
+
+    @use_past_key_values.setter
+    def use_past_key_values(self, use_past_key_values):
+        self._use_past_key_values = use_past_key_values
+
+    def get_mask_with_past_key_values(self, mask):
+        if self.past_key_values is None:
+            raise ValueError('past_key_values is None, please set it first')
+        batch_size = mask.shape[0]
+        past_key_values_len = self.past_key_values[0][0].shape[2]
+        mask = torch.cat(
+            [torch.ones(batch_size, past_key_values_len, dtype=torch.bool, device=self.device),
+             mask], dim=1)
+        return mask
+
+    def get_past_key_values(self, inputs):
+        if self.past_key_values is None:
+            raise ValueError('past_key_values is None, please set it first')
+        batch_size = inputs['input_ids'].shape[0]
+        past_key_values = ()
+        for layer_key, layer_value in self.past_key_values:
+            past_key_values += (
+                                   layer_key.expand(batch_size, -1, -1, -1),
+                                   layer_value.expand(batch_size, -1, -1, -1)),
+
+        return past_key_values
+
+    @torch.no_grad()
+    def forward_no_grad(self, inputs):
+        ori_logits, results = self.cal_logits(inputs, **self.results_args)
+        probs, logits = self._cal_probs(ori_logits)
+        probs_from_results = self.cal_probs_from_results(inputs, results)
+        probs_from_results['ori_logits'] = ori_logits
+        return probs, probs_from_results
+
+    def forward(self, **kwargs):
+        ori_logits, results = self.cal_logits(kwargs, **self.results_args)
+        probs, logits = self._cal_probs(ori_logits)
+        result = {'probs': probs, 'logits': logits, 'results': results}
+        if self.probs_from_results_fn:
+            probs_from_results = self.cal_probs_from_results(kwargs, results)
+            result['probs_from_results'] = probs_from_results
+        result['ori_logits'] = ori_logits
+        return result
+
+
+
+---
+File: /icl/util_classes/__init__.py
+---
+
+
+
+
+---
+File: /icl/util_classes/arg_classes.py
+---
+
+import os
+import pickle
+import warnings
+from dataclasses import field, dataclass
+from typing import List, Optional
+from ..project_constants import FOLDER_ROOT
+
+
+def set_default_to_empty_string(v, default_v, activate_flag):
+    if ((default_v is not None and v == default_v) or (
+            default_v is None and v is None)) and (activate_flag):
+        return ""
+    else:
+        return f'_{v}'
+
+
+@dataclass
+class DeepArgs:
+    task_name: str = "sst2"
+    model_name: str = "gpt2-xl"
+    seeds: List[int] = field(default_factory=lambda: [42])
+    sample_size: int = 1000
+    demonstration_shot: int = 1
+    demonstration_from: str = 'train'
+    demonstration_total_shot: int = None
+    sample_from: str = 'test'
+    device: str = 'cuda:0'
+    batch_size: int = 1
+    save_folder: str = os.path.join(FOLDER_ROOT, 'results', 'deep')
+    using_old: bool = False
+
+    @property
+    def save_file_name(self):
+        file_name = (
+            f"{self.task_name}_{self.model_name}_{self.demonstration_shot}_{self.demonstration_from}"
+            f"_{self.sample_from}_{self.sample_size}_{'_'.join([str(seed) for seed in self.seeds])}")
+        file_name += set_default_to_empty_string(self.demonstration_total_shot, None,
+                                                 self.using_old)
+        file_name = os.path.join(self.save_folder, file_name)
+        return file_name
+
+    def __post_init__(self):
+        assert self.demonstration_from in ['train']
+        assert self.sample_from in ['test']
+        assert self.task_name in ['sst2', 'agnews', 'trec', 'emo']
+        assert self.model_name in ['gpt2-xl', 'gpt-j-6b']
+        assert 'cuda:' in self.device
+        self.gpu = int(self.device.split(':')[-1])
+        self.actual_sample_size = self.sample_size
+
+        if self.task_name == 'sst2':
+            label_dict = {0: ' Negative', 1: ' Positive'}
+        elif self.task_name == 'agnews':
+            label_dict = {0: ' World', 1: ' Sports', 2: ' Business', 3: ' Technology'}
+        elif self.task_name == 'trec':
+            label_dict = {0: ' Abbreviation', 1: ' Entity', 2: ' Description', 3: ' Person',
+                          4: ' Location',
+                          5: ' Number'}
+        elif self.task_name == 'emo':
+            label_dict = {0: ' Others', 1: ' Happy', 2: ' Sad', 3: ' Angry'}
+        else:
+            raise NotImplementedError(f"task_name: {self.task_name}")
+        self.label_dict = label_dict
+
+    def load_result(self):
+        with open(self.save_file_name, 'rb') as f:
+            return pickle.load(f)
+
+
+@dataclass
+class ReweightingArgs(DeepArgs):
+    save_folder: str = os.path.join(FOLDER_ROOT, 'results', 'reweighting')
+    lr: float = 0.1
+    train_num_per_class: int = 4
+    epoch_num: int = 10
+    n_head: int = 25  # 25
+
+    def __post_init__(self):
+        super(ReweightingArgs, self).__post_init__()
+        save_folder = os.path.join(self.save_folder,
+                                   f"lr_{self.lr}_train_num_{self.train_num_per_class}_epoch_{self.epoch_num}"
+                                   f"_nhead_{self.n_head}")
+        self.save_folder = save_folder
+
+
+@dataclass
+class CompressArgs(DeepArgs):
+    save_folder: str = os.path.join(FOLDER_ROOT, 'results', 'compress')
+
+@dataclass
+class CompressTopArgs(DeepArgs):
+    ks_num: int = 20
+    save_folder: str = os.path.join(FOLDER_ROOT, 'results', 'compress_top')
+
+
+@dataclass
+class CompressTimeArgs(DeepArgs):
+    save_folder: str = os.path.join(FOLDER_ROOT, 'results', 'compress_time')
+
+
+@dataclass
+class AttrArgs(DeepArgs):
+    save_folder: str = os.path.join(FOLDER_ROOT, 'results', 'attr')
+
+
+@dataclass
+class ShallowArgs(DeepArgs):
+    mask_layer_num: int = 5
+    mask_layer_pos: str = 'first'  # first, last
+    save_folder: str = os.path.join(FOLDER_ROOT, 'results', 'shallow')
+
+    @property
+    def save_file_name(self):
+        file_name = (
+            f"{self.task_name}_{self.model_name}_{self.demonstration_shot}_{self.demonstration_from}"
+            f"_{self.sample_from}_{self.sample_size}_{'_'.join([str(seed) for seed in self.seeds])}"
+            f'_{self.mask_layer_num}_{self.mask_layer_pos}')
+        file_name += set_default_to_empty_string(self.demonstration_total_shot, None,
+                                                 self.using_old)
+
+        file_name = os.path.join(self.save_folder, file_name)
+        return file_name
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert self.mask_layer_pos in ['first', 'last']
+        if self.mask_layer_num < 0:
+            warnings.warn(f"mask_layer_num: {self.mask_layer_num} < 0!")
+
+
+@dataclass
+class NClassificationArgs(DeepArgs):
+    save_folder: str = os.path.join(FOLDER_ROOT, 'results', 'nclassfication')
+
+@dataclass
+class ShallowNonLabelArgs(ShallowArgs):
+    save_folder: str = os.path.join(FOLDER_ROOT, 'results', 'shallow_non_label')
+
+
+---
+File: /icl/util_classes/context_solver.py
+---
+
+import warnings
+from copy import deepcopy
+
+import torch
+
+from ..utils.data_wrapper import format_s_dict
+from ..utils.other import TensorStrFinder
+
+
+class ContextSolver:
+    def __init__(self, task_name, tokenizer=None):
+        assert task_name in ['sst2', 'trec', 'agnews', 'emo']
+        self.task_name = task_name
+        self.tokenizer = tokenizer
+        self.format_s = format_s_dict[task_name]
+        self.parse_format_s()
+
+    def parse_format_s(self):
+        self.X_prefix = self.format_s.split('\n')[0].split(':')[0] + ':'
+        self.Y_prefix = self.format_s.split('\n')[1].split(':')[0] + ':'
+
+    def get_empty_demo_context(self, context: str, only_demo_part=True):
+        context = context.split('\n')
+        for i, line in enumerate(context[:-2]):
+            if self.X_prefix in line:
+                line = self.X_prefix
+            elif self.Y_prefix in line:
+                line = line
+            else:
+                raise warnings.warn('Global prefix or other str exists!')
+            context[i] = line
+        if only_demo_part:
+            context = context[:-2]
+        context = '\n'.join(context)
+        return context
+
+    def get_mask_strings_and_match_before(self, context, input_ids, tokenizer=None):
+        if tokenizer is None:
+            tokenizer = self.tokenizer
+        poss = torch.where(input_ids == tokenizer.encode('\n', add_special_tokens=False)[0])[0]
+        if len(poss) >= 2:
+            match_before = poss[-2] + 1
+        else:
+            match_before = None
+
+        list_s = []
+        list_s.append(self.X_prefix)
+        list_s.append('\n' + self.X_prefix)
+        context = context.split('\n')
+        for i, line in enumerate(context[:-2]):
+            if self.X_prefix in line:
+                pass
+            elif self.Y_prefix in line:
+                list_s.append('\n' + line)
+                list_s.append('\n' + line + '\n')
+            else:
+                raise warnings.warn('Global prefix or other str exists!')
+        return list_s, match_before
+
+    def get_mask(self, input_ids, tokenizer=None):
+        if isinstance(input_ids, list):
+            input_ids = torch.tensor(input_ids)
+        if len(input_ids.shape) == 2:
+            assert input_ids.shape[0] == 1
+            input_ids = input_ids[0]
+        if tokenizer is None:
+            tokenizer = self.tokenizer
+        context = tokenizer.decode(input_ids)
+        list_s, match_before = self.get_mask_strings_and_match_before(context, input_ids=input_ids,
+                                                                      tokenizer=tokenizer)
+        tensor_str_finder = TensorStrFinder(tokenizer=tokenizer)
+        mask = tensor_str_finder.get_strs_mask_in_tensor(list_s=list_s, t=input_ids,
+                                                         match_before=match_before)
+        return mask
+
+
+
+---
+File: /icl/util_classes/predictor_classes.py
+---
+
+import warnings
+
+import torch
+
+
+class Predictor:
+    def __init__(self, label_id_dict, pad_token_id, task_name, tokenizer, layer,
+                 naive_class_embs=None,
+                 naive_final_emb=None) -> None:
+        self.naive_class_embs = naive_class_embs
+        self.naive_final_emb = naive_final_emb
+        self.label_id_dict = label_id_dict
+        self.pad_token_id = pad_token_id
+        self.task_name = task_name
+        self.tokenizer = tokenizer
+        self.layer = layer
+
+        if task_name == 'sst2':
+            self.prefix_idxs = [tokenizer.encode('Sentiment', add_special_tokens=False)[-1],
+                                tokenizer.encode(':', add_special_tokens=False)[0]]
+        elif task_name == 'agnews':
+            self.prefix_idxs = [tokenizer.encode('Answer', add_special_tokens=False)[-1],
+                                tokenizer.encode(':', add_special_tokens=False)[0]]
+        elif task_name == 'trec':
+            self.prefix_idxs = [tokenizer.encode(' Type', add_special_tokens=False)[-1],
+                                tokenizer.encode(':', add_special_tokens=False)[0]]
+        elif task_name == 'emo':
+            self.prefix_idxs = [tokenizer.encode('Emotion', add_special_tokens=False)[-1],
+                                tokenizer.encode(':', add_special_tokens=False)[0]]
+        else:
+            raise NotImplementedError(f"task_name: {task_name}")
+
+    def get_pos(self, inputs):
+        label_id_dict = self.label_id_dict
+        pad_token_id = self.pad_token_id
+        final_pos = (inputs['input_ids'] != pad_token_id).int().sum(-1) - 1
+        device = inputs['input_ids'].device
+        bsz, sql = inputs['input_ids'].shape
+        class_poss = []
+        for idx in label_id_dict.values():
+            class_idx = idx
+            for offset, prefix_idx in enumerate(reversed(self.prefix_idxs)):
+                class_idx += prefix_idx * 100000 ** (offset + 1)
+            input_ids = inputs['input_ids'].detach().clone()
+            input_ids[:, 1:] += inputs['input_ids'][:, :-1] * 100000
+            input_ids[:, 2:] += inputs['input_ids'][:, :-2] * 100000 * 100000
+            class_pos = torch.arange(sql, device=device).unsqueeze(0).repeat(bsz, 1)[
+                input_ids == class_idx].squeeze()
+            class_poss.append(class_pos)
+        return class_poss, final_pos
+
+    def _cal_all_key_and_values_of_class(self, inputs, past_key_values, one_class_one_list=False,
+                                         include_final=False):
+        class_poss, final_pos = self.get_pos(inputs)
+
+        if include_final:
+            class_poss.append(final_pos)
+
+        def get_vecs(ker_or_value, class_poss):
+            batch_idx = torch.arange(inputs['input_ids'].shape[0])
+            class_vecs = []
+            for poss in class_poss:
+                class_vec = ker_or_value[batch_idx, :, poss, :]
+                class_vecs.append(class_vec.unsqueeze(-2))
+            if not one_class_one_list:
+                class_vecs = torch.cat(class_vecs, dim=-2)
+            return class_vecs
+
+        key_and_values = []
+        for layer in range(0, self.layer):
+            key_and_values.append(tuple([get_vecs(_, class_poss) for _ in past_key_values[layer]]))
+        return key_and_values  # tuple of tuple of tensor (bsz, n_head, num_class, d_head)
+
+    def cal_all_key_and_values_of_class(self, inputs, results, one_class_one_list=False,
+                                        include_final=False):
+        past_key_values = results.past_key_values
+        key_and_values = self._cal_all_key_and_values_of_class(inputs, past_key_values,
+                                                               one_class_one_list=one_class_one_list,
+                                                               include_final=include_final)
+        return key_and_values  # tuple of tuple of tensor (bsz, n_head, num_class, d_head)
+
+    def get_attention(self, inputs, results, layer):
+        class_poss, final_pos = self.get_pos(inputs)
+        batch_idx = torch.arange(inputs['input_ids'].shape[0])
+        scores = []
+        for class_pos in class_poss:
+            attention = results.attentions[layer][batch_idx, :, final_pos, class_pos]
+            score = attention
+            if class_pos.numel() == 1:
+                score = score.sum(-1)
+            else:
+                score = score.sum()
+            if inputs['input_ids'].shape[0] != 1:
+                warnings.warn(f'Only support batch_size=1 now!')
+            scores.append(score.unsqueeze(0))
+        scores = torch.cat(scores, dim=0)
+        return scores
+
+    def cal_all_sim_attn(self, inputs, results):
+        sims = []
+        for layer in range(0, self.layer):
+            sim = self.get_attention(inputs=inputs, results=results, layer=layer)
+            sims.append(sim.unsqueeze(1))
+        sims = torch.cat(sims, dim=1)
+        sims = sims.reshape(inputs['input_ids'].shape[0], -1)
+        return sims
+
+
+
+---
+File: /icl/util_classes/setter_with_restore.py
+---
+
+import weakref
+
+
+class SetterWithRestore:
+    def __init__(self):
+        self.attribute_history = {}
+
+    def set(self, bound_method, new_value):
+        obj = bound_method.__self__
+        attr_name = bound_method.__name__
+
+        key = (weakref.ref(obj), attr_name)
+        if key not in self.attribute_history:
+            self.attribute_history[key] = getattr(obj, attr_name)
+
+        setattr(obj, attr_name, new_value)
+
+    def restore(self, bound_method):
+        obj = bound_method.__self__
+        attr_name = bound_method.__name__
+
+        key = (weakref.ref(obj), attr_name)
+        if key in self.attribute_history:
+            setattr(obj, attr_name, self.attribute_history[key])
+            del self.attribute_history[key]
+        else:
+            print(f"{attr_name} has not been set by the setter.")
+
+    def restore_all(self):
+        for key, original_value in self.attribute_history.items():
+            obj_ref, attr_name = key
+            obj = obj_ref()
+            if obj is not None:
+                setattr(obj, attr_name, original_value)
+
+        self.attribute_history.clear()
+
+
+
+---
+File: /icl/utils/__init__.py
+---
+
+
+
+
+---
+File: /icl/utils/data_wrapper.py
+---
+
+import datasets
+
+format_s_dict = {
+    'sst2': 'Review: {text}\nSentiment:{label}',
+    'agnews': 'Article: {text}\nAnswer:{label}',
+    'trec': 'Question: {question}\nAnswer Type:{label}',
+    'emo': 'Dialogue: {text}\nEmotion:{label}',
+}
+
+
+def sst2_wrap_data(demonstrations, input_sample, label_dict):
+    format_s = format_s_dict['sst2']
+    prompts = [format_s.format(text=sample['text'], label=label_dict[sample['label']]) for
+               sample in demonstrations]
+    inputs = format_s.format(text=input_sample['text'], label="")
+    if len(prompts) > 0:
+        inputs = "\n".join(prompts + [inputs])
+    return inputs
+
+
+def trec_wrap_data(demonstrations, input_sample, label_dict):
+    format_s = format_s_dict['trec']
+    prompts = [format_s.format(question=sample['text'], label=label_dict[sample['label']]) for
+               sample in demonstrations]
+    inputs = format_s.format(question=input_sample['text'], label="")
+    if len(prompts) > 0:
+        inputs = "\n".join(prompts + [inputs])
+    return inputs
+
+
+def emo_wrap_data(demonstrations, input_sample, label_dict):
+    format_s = format_s_dict['emo']
+    prompts = [format_s.format(text=sample['text'], label=label_dict[sample['label']]) for
+               sample in demonstrations]
+    inputs = format_s.format(text=input_sample['text'], label="")
+    if len(prompts) > 0:
+        inputs = "\n".join(prompts + [inputs])
+    return inputs
+
+
+def agnews_wrap_data(demonstrations, input_sample, label_dict):
+    format_s = format_s_dict['agnews']
+    prompts = [format_s.format(text=sample['text'],
+                               label=label_dict[sample['label']]) for
+               sample in demonstrations]
+    inputs = format_s.format(text=input_sample['text'],
+                             label="")
+    if len(prompts) > 0:
+        inputs = "\n".join(prompts + [inputs])
+    return inputs
+
+
+def wrap_data(demonstrations, input_sample, label_dict, task_name):
+    if task_name == 'sst2':
+        return sst2_wrap_data(demonstrations, input_sample, label_dict)
+    elif task_name == 'agnews':
+        return agnews_wrap_data(demonstrations, input_sample, label_dict)
+    elif task_name == 'trec':
+        return trec_wrap_data(demonstrations, input_sample, label_dict)
+    elif task_name == 'emo':
+        return emo_wrap_data(demonstrations, input_sample, label_dict)
+    else:
+        raise NotImplementedError(f"task_name: {task_name}")
+
+
+def instruct_wrapper(instruct: str, input_sample, label_dict, task_name):
+    inputs = wrap_data(demonstrations=[], input_sample=input_sample, label_dict=label_dict,
+                       task_name=task_name)
+    format_s = '{instruct}\n{text}'
+    inputs = format_s.format(text=inputs,
+                             instruct=instruct)
+    return inputs
+
+
+def wrap_dataset(dataset: datasets.arrow_dataset.Dataset, demonstration, label_dict, task_name):
+    def wrap(example):
+        example['sentence'] = wrap_data(demonstrations=demonstration, input_sample=example,
+                                        label_dict=label_dict, task_name=task_name)
+        example['labels'] = example['label']
+        return example
+
+    dataset = dataset.map(wrap)
+    return dataset
+
+
+def wrap_dataset_with_instruct(dataset: datasets.arrow_dataset.Dataset, instruct, label_dict,
+                               task_name):
+    def wrap(example):
+        example['sentence'] = instruct_wrapper(instruct=instruct, input_sample=example,
+                                               label_dict=label_dict, task_name=task_name)
+        example['labels'] = example['label']
+        return example
+
+    dataset = dataset.map(wrap)
+    return dataset
+
+
+# you may add your tokenizer's name or local path (corresponding to tokenizer.name_or_path)
+# to this dict, and the corresponding model max length
+default_max_length_dict = {
+    'gpt2': 1024,
+}
+
+
+def get_max_length(tokenizer):
+    if tokenizer.name_or_path in default_max_length_dict:
+        return default_max_length_dict[tokenizer.name_or_path]
+    max_length = tokenizer.max_len_single_sentence
+    if max_length > 10000000:
+        max_length = tokenizer.model_max_length
+    if max_length > 10000000:
+        raise ValueError(
+            f"Your tokenizer has a very large `max_len_single_sentence` value: {max_length}, "
+            f"you may add this to tokenizer's config, or add it to `default_max_length_dict` above")
+    return max_length
+
+
+def tokenize_dataset(dataset, tokenizer):
+    def tokenize_function(examples):
+        return tokenizer(examples["sentence"], padding=True,
+                         max_length=get_max_length(tokenizer),
+                         truncation=True,
+                         return_tensors='pt')
+
+    tokenized_datasets = dataset.map(tokenize_function, batched=True)
+    return tokenized_datasets
+
+
+def remove_str_columns(dataset):
+    remove_keys = {k for k, v in dataset.features.items() if v.dtype == 'string'}
+    dataset = dataset.remove_columns(list(remove_keys))
+    return dataset
+
+
+
+---
+File: /icl/utils/display_utils.py
+---
+
+import torch
+
+
+def apply_on_element(l,fn=None):
+    if isinstance(l, torch.Tensor):
+        l = l.tolist()
+    if isinstance(l, list):
+        return [apply_on_element(_,fn) for _ in l]
+    elif isinstance(l, dict):
+        return {k: apply_on_element(v,fn) for k, v in l.items()}
+    else:
+        return fn(l)
+
+def show_words(logits, tokenizer,topk=5):
+    logits = torch.tensor(logits)
+    token_ids = logits.topk(topk,dim=-1)[1]
+    words = apply_on_element(token_ids,tokenizer.decode)
+    print(words)
+
+
+---
+File: /icl/utils/experiment_utils.py
+---
+
+import os
+import pickle
+import warnings
+from time import sleep
+from typing import *
+import numpy as np
+from copy import deepcopy, copy
+import random
+
+
+def get_gpu_ids(gpu_num=100, gpu_ids=None, min_memory: float = 5000):
+    if gpu_ids is None:
+        gpu_ids = []
+    os.makedirs("./buffer", exist_ok=True)
+    auto_num = gpu_num - (0 if gpu_ids is None else len(gpu_ids))
+    os.system('nvidia-smi -q -d Memory |grep -A4 GPU|grep Free > ./buffer/tmp')
+    memory_gpu = [int(x.split()[2]) for x in open('./buffer/tmp', 'r').readlines()]
+    enough_memory_gpu_ids = [(idx, _) for idx, _ in enumerate(memory_gpu) if _ > min_memory]
+    enough_memory_gpu_ids = sorted(enough_memory_gpu_ids, key=lambda x: x[1], reverse=True)
+    auto_gpu_ids = [idx for idx, _ in
+                    enough_memory_gpu_ids[0:max(auto_num, len(enough_memory_gpu_ids))]]
+    gpu_ids.extend(auto_gpu_ids)
+    return gpu_ids
+
+
+def set_gpu(gpus: Union[List[int], int]):
+    gpus = [str(gpus)] if isinstance(gpus, int) else [str(_) for _ in gpus]
+    gpus = ",".join(gpus)
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpus
+
+
+class Combination_iterater:
+    def __init__(self, hyperparameter_lists: Dict[str, List[Any]]):
+        self.hyperparameter_lists: Dict[str, List[Any]] = hyperparameter_lists
+        self.hyperparameter_list_lengths: List[int] = [len(_) for _ in
+                                                       hyperparameter_lists.values()]
+        self.length = int(np.prod(self.hyperparameter_list_lengths))
+        self.step: int = 0
+
+    def get_combination_decode_int2indexs(self, i: int) -> List[int]:
+        assert i < self.length
+        indexs = []
+        for _ in self.hyperparameter_list_lengths:
+            indexs.append(i % _)
+            i //= _
+        return indexs
+
+    def get_combination(self, i: int) -> Dict[str, Any]:
+        indexs = self.get_combination_decode_int2indexs(i)
+        hyperparameters = {k: v[index] for (k, v), index in
+                           zip(self.hyperparameter_lists.items(), indexs)}
+        return hyperparameters
+
+    def __next__(self) -> Dict[str, Any]:
+        if self.step >= self.length:
+            raise StopIteration
+        hyperparameters = self.get_combination(self.step)
+        self.step += 1
+        return hyperparameters
+
+    def __iter__(self):
+        return self
+
+    def __len__(self):
+        return self.length - self.step
+
+
+class Gpu_assinger:
+    def __init__(self, gpu_list: List[int], min_memory: float = 0):
+        if gpu_list is None:
+            gpu_list = get_gpu_ids(min_memory=min_memory)
+        self.gpu_list = gpu_list
+        self.free_gpu_list = copy(gpu_list)
+        warnings.warn('free gpu list is deprecated, use gpu_list instead')
+        print(f"free gpu list: {self.free_gpu_list}")
+
+    def get(self) -> int:
+        if len(self.free_gpu_list) > 0:
+            free_gpu = self.free_gpu_list.pop(0)
+            return free_gpu
+        else:
+            return -1
+
+    def add(self, free_gpu: int) -> None:
+        self.free_gpu_list.append(free_gpu)
+
+
+class Sh_run:
+    def __init__(self, hyperparameter_lists: List[Dict[str, List[Any]]],
+                 gpu_list: List[int] = None, default_sh_file="./gpu_sh.sh") -> None:
+        self.experiment_strs = [_['expr'] for _ in hyperparameter_lists]
+        for _ in hyperparameter_lists:
+            _.pop('expr')
+        self.hyper_combinator_iterators = [
+            Combination_iterater(hyperparameter_lists=hyperparameter_list) for hyperparameter_list
+            in hyperparameter_lists]
+        self.gpu_assigner = Gpu_assinger(gpu_list=gpu_list)
+        self.gpu_list = self.gpu_assigner.free_gpu_list
+        self.gpu_str_dict: Dict[int, str] = {gpu: "" for gpu in self.gpu_list}
+        self.default_sh_file = default_sh_file
+        self.explicit_set_gpu = False
+
+    def generate_specific_sh_file_name(self, gpu: int) -> str:
+        return self.default_sh_file.replace(".sh", "%d.sh" % gpu)
+
+    def get_args_str(self, arg_dict: Dict[str, Any]) -> str:
+        s = []
+        for k, v in arg_dict.items():
+            if isinstance(v, bool) and v == True:
+                s.append("--%s" % k)
+            else:
+                s.append("--%s %s" % (k, str(v)))
+        s = " ".join(s)
+        return s
+
+    def run(self):
+        _ = 0
+        for expr, hyper_combinator_iterator in zip(self.experiment_strs,
+                                                   self.hyper_combinator_iterators):
+            for i, hyper_arg in enumerate(hyper_combinator_iterator):
+                gpu = self.gpu_assigner.get()
+                if not self.explicit_set_gpu:
+                    hyper_arg["device"] = f'cuda:{gpu}'
+                    prefix_str = "nohup"
+                else:
+                    prefix_str = f"CUDA_VISIBLE_DEVICES={gpu}"
+                s = " ".join([prefix_str, expr, self.get_args_str(hyper_arg)])
+                self.gpu_str_dict[gpu] += s + "\n"
+                self.gpu_assigner.add(gpu)
+        for k, v in self.gpu_str_dict.items():
+            with open(self.generate_specific_sh_file_name(k), "w") as f:
+                f.write(v)
+        with open(self.default_sh_file, "w") as f:
+            s = ""
+            for k in self.gpu_str_dict.keys():
+                s += " ".join(["nohup sh", self.generate_specific_sh_file_name(k), "&"]) + "\n"
+            f.write(s)
+
+def get_perf_from_perf_dict(perf_dict: Dict[str, Any], perf_name: Optional[str] = None):
+    if perf_name is None:
+        if 'acc' in perf_dict:
+            perf_name = 'acc'
+        elif 'f1' in perf_dict:
+            perf_name = 'f1'
+        elif 'f' in perf_dict:
+            perf_name = 'f'
+        else:
+            raise ValueError("perf_name is None, and can't find proper erf_name in perf_dict")
+    perf = perf_dict[perf_name]
+    if isinstance(perf, list):
+        perf = np.mean(perf)
+    return perf
+
+
+
+---
+File: /icl/utils/load_huggingface_dataset.py
+---
+
+import os.path
+
+from datasets import load_dataset, load_from_disk
+
+ROOT_FOLEDER = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def load_from_local(task_name, splits):
+    dataset_path = os.path.join(ROOT_FOLEDER, 'datasets', task_name)
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"dataset_path: {dataset_path}")
+    dataset = load_from_disk(dataset_path)
+    dataset = [dataset[split] for split in splits]
+    return dataset
+
+
+def load_huggingface_dataset_train_and_test(task_name):
+    dataset = None
+    if task_name == 'sst2':
+        try:
+            dataset = load_from_local(task_name, ['train', 'validation'])
+        except FileNotFoundError:
+            dataset = load_dataset('glue', 'sst2', split=['train', 'validation'])
+        for i, _ in enumerate(dataset):
+            dataset[i] = dataset[i].rename_column('sentence', 'text')
+        # rename validation to test
+    elif task_name == 'agnews':
+        try:
+            dataset = load_from_local(task_name, ['train', 'test'])
+        except FileNotFoundError:
+            dataset = load_dataset('ag_news', split=['train', 'test'])
+    elif task_name == 'trec':
+        try:
+            dataset = load_from_local(task_name, ['train', 'test'])
+        except FileNotFoundError:
+            dataset = load_dataset('trec', split=['train', 'test'])
+        coarse_label_name = 'coarse_label' if 'coarse_label' in dataset[
+            0].column_names else 'label-coarse'
+        for i, _ in enumerate(dataset):
+            dataset[i] = dataset[i].rename_column(coarse_label_name, 'label')
+    elif task_name == 'emo':
+        try:
+            dataset = load_from_local(task_name, ['train', 'test'])
+        except FileNotFoundError:
+            dataset = load_dataset('emo', split=['train', 'test'])
+    if dataset is None:
+        raise NotImplementedError(f"task_name: {task_name}")
+    dataset = {'train': dataset[0], 'test': dataset[1]}
+    return dataset
+
+
+
+---
+File: /icl/utils/load_local.py
+---
+
+import os.path
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+ROOT_PATH_LIST = ['Your_path'] # add your model path if you want to load local models
+
+
+
+def convert_path_old(path: str, ROOT_PATH, load_type: str) -> str:
+    assert load_type in ['tokenizer', 'model']
+    return os.path.join(ROOT_PATH, load_type + 's', path)
+
+def convert_path(path: str, ROOT_PATH, load_type: str) -> str:
+    assert load_type in ['tokenizer', 'model']
+    return os.path.join(ROOT_PATH, path)
+
+def load_local_model_or_tokenizer(model_name: str, load_type: str):
+    if load_type in 'tokenizer':
+        LoadClass = AutoTokenizer
+    elif load_type in 'model':
+        LoadClass = AutoModelForCausalLM
+    else:
+        raise ValueError(f'load_type: {load_type} is not supported')
+
+    model = None
+    for ROOT_PATH in ROOT_PATH_LIST:
+        try:
+            folder_path = convert_path_old(model_name, ROOT_PATH, load_type)
+            if not os.path.exists(folder_path):
+                continue
+            print(f'loading {model_name} {load_type} from {folder_path} ...')
+            model = LoadClass.from_pretrained(folder_path)
+            print('finished loading')
+            break
+        except:
+            continue
+    if model is not None:
+        return model
+    for ROOT_PATH in ROOT_PATH_LIST:
+        try:
+            folder_path = convert_path(model_name, ROOT_PATH, load_type)
+            if not os.path.exists(folder_path):
+                continue
+            print(f'loading {model_name} {load_type} from {folder_path} ...')
+            model = LoadClass.from_pretrained(folder_path)
+            print('finished loading')
+            break
+        except:
+            continue
+    return model
+
+def get_model_layer_num(model = None, model_name = None):
+    num_layer = None
+    if model is not None:
+        if hasattr(model.config, 'num_hidden_layers'):
+            num_layer = model.config.num_hidden_layers
+        elif hasattr(model.config, 'n_layers'):
+            num_layer = model.config.n_layers
+        elif hasattr(model.config, 'n_layer'):
+            num_layer = model.config.n_layer
+        else:
+            pass
+    elif model_name is not None:
+        pass
+    if num_layer is None:
+        raise ValueError(f'cannot get num_layer from model: {model} or model_name: {model_name}')
+    return num_layer
+
+
+
+---
+File: /icl/utils/other.py
+---
+
+import functools
+import warnings
+from typing import Union, List, Optional
+
+import numpy as np
+import torch
+from transformers import HfArgumentParser
+import os
+from .random_utils import np_temp_random
+
+REDUCE_FN_MAPPINGS = {
+    'sum': torch.sum,
+    'mean': torch.mean,
+    'none': lambda x: x
+}
+
+
+def apply_on_element(l, fn=None):
+    if isinstance(l, torch.Tensor):
+        l = l.tolist()
+    if isinstance(l, list):
+        return [apply_on_element(_, fn) for _ in l]
+    elif isinstance(l, dict):
+        return {k: apply_on_element(v, fn) for k, v in l.items()}
+    else:
+        return fn(l)
+
+
+def show_words(logits, tokenizer, topk=5):
+    token_ids = logits.topk(topk)[1]
+    words = apply_on_element(token_ids, tokenizer.convert_ids_to_tokens)
+    print(words)
+
+
+def load_args(args_type, is_ipynb=False):
+    if not is_ipynb:
+        parser = HfArgumentParser((args_type,))
+        args, = parser.parse_args_into_dataclasses()
+    else:
+        args = args_type()
+    return args
+
+
+
+def sample_two_set_with_shot_per_class(ori_data, a_shot, b_shot, seed, label_name: str = 'labels',
+                                       a_total_shot=None, b_total_shot=None):
+    a_label_count = {}
+    b_label_count = {}
+    a_data_idx = []
+    b_data_idx = []
+    all_indices = [_ for _ in range(len(ori_data))]
+    np_temp_random(seed=seed)(np.random.shuffle)(all_indices)
+
+    a_total_cnt = 0
+    b_total_cnt = 0
+    for index in all_indices:
+        label = ori_data[index][label_name]
+        if label < 0:
+            continue
+
+        if label not in a_label_count.keys():
+            a_label_count[label] = 0
+        if label not in b_label_count.keys():
+            b_label_count[label] = 0
+
+        if a_label_count[label] < a_shot:
+            a_data_idx.append(index)
+            a_label_count[label] += 1
+            a_total_cnt += 1
+        elif b_label_count[label] < b_shot:
+            b_data_idx.append(index)
+            b_label_count[label] += 1
+            b_total_cnt += 1
+
+        a_cond = a_total_shot is not None and a_total_cnt >= a_total_shot
+        b_cond = (b_total_shot is not None and b_total_cnt >= b_total_shot) or (b_shot == 0)
+        if a_cond and b_cond:
+            warnings.warn(f"sampled {a_total_shot} and {b_total_shot} samples, ")
+
+    a_data = ori_data.select(a_data_idx)
+    b_data = ori_data.select(b_data_idx)
+    return a_data, b_data
+
+
+def dict_to(d: dict, device):
+    for k, v in d.items():
+        if isinstance(v, torch.Tensor):
+            d[k] = v.to(device)
+    return d
+
+
+def set_gpu(gpu_id: Union[str, int]):
+    if isinstance(gpu_id, int):
+        gpu_id = str(gpu_id)
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+
+
+class TensorStrFinder:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def find_tensor_in_tensor(self, a_tensor: Union[torch.Tensor, list], b_tensor: torch.Tensor,
+                              return_mask=True, match_before: Optional[int] = None):
+        if len(b_tensor.shape) == 2:
+            assert b_tensor.shape[0] == 1
+            b_tensor = b_tensor[0]
+        if isinstance(a_tensor, list):
+            a_tensor = torch.tensor(a_tensor)
+        if a_tensor.device != b_tensor.device:
+            a_tensor = a_tensor.to(b_tensor.device)
+
+        window_size = len(a_tensor)
+        b_windows = b_tensor.unfold(0, window_size, 1)
+
+        matches = torch.all(b_windows == a_tensor, dim=1)
+
+        positions = torch.nonzero(matches, as_tuple=True)[0]
+
+        if return_mask:
+            mask = torch.zeros_like(b_tensor, dtype=torch.bool)
+            for pos in positions:
+                if match_before is None or pos + window_size <= match_before:
+                    mask[pos:pos + window_size] = True
+            return mask
+
+        return positions
+
+    def find_str_in_tensor(self, s: str, t: torch.Tensor, return_mask=True, match_before=None):
+        s_tokens = self.tokenizer.encode(s, add_special_tokens=False)
+        s_tensor = torch.LongTensor(s_tokens)
+        return self.find_tensor_in_tensor(s_tensor, t, return_mask=return_mask,
+                                          match_before=match_before)
+
+    def get_strs_mask_in_tensor(self, list_s: List[str], t: torch.Tensor, match_before=None):
+        list_s_tokens = [self.tokenizer.encode(s, add_special_tokens=False) for s in list_s]
+        list_s_tensor = [torch.LongTensor(s_tokens) for s_tokens in list_s_tokens]
+        mask_tensor_list = [
+            self.find_tensor_in_tensor(s_tensor, t, return_mask=True, match_before=match_before) for
+            s_tensor in list_s_tensor]
+        mask_tensor = functools.reduce(torch.logical_or, mask_tensor_list)
+        return mask_tensor
+
+
+
+---
+File: /icl/utils/prepare_model_and_tokenizer.py
+---
+
+import warnings
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+from .load_local import load_local_model_or_tokenizer
+from ..util_classes.arg_classes import DeepArgs
+
+
+def load_model_and_tokenizer(args: DeepArgs):
+    if args.model_name in ['gpt2-xl', 'gpt-j-6b']:
+        tokenizer = load_local_model_or_tokenizer(args.model_name, 'tokenizer')
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        model = load_local_model_or_tokenizer(args.model_name, 'model')
+        if model is None:
+            model = AutoModelForCausalLM.from_pretrained(args.model_name)
+        tokenizer.pad_token = tokenizer.eos_token
+    else:
+        raise NotImplementedError(f"model_name: {args.model_name}")
+    return model, tokenizer
+
+
+def get_label_id_dict_for_args(args: DeepArgs, tokenizer):
+    label_id_dict = {k: tokenizer.encode(v, add_special_tokens=False)[0] for k, v in
+                          args.label_dict.items()}
+    for v in args.label_dict.values():
+        token_num = len(tokenizer.encode(v, add_special_tokens=False))
+        if token_num != 1:
+            warnings.warn(f"{v} in {args.task_name} has token_num: {token_num} which is not 1")
+    return label_id_dict
+
+
+
+---
+File: /icl/utils/random_utils.py
+---
+
+import numpy as np
+import random, os
+import torch.backends.cudnn
+
+
+def set_seed(seed):
+    seed = int(seed)
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.enabled = True
+
+
+def np_temp_random(seed: int):
+    def np_temp_random_inner(func):
+        def np_temp_random_innner_inner(*args, **kwargs):
+            ori_state = np.random.get_state()
+            np.random.seed(seed)
+            result = func(*args, **kwargs)
+            np.random.set_state(ori_state)
+            return result
+
+        return np_temp_random_innner_inner
+
+    return np_temp_random_inner
+
+
+
+---
+File: /icl/utils/visualization.py
+---
+
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+
+def plot_confusion_matrix(predictions, labels, classes, title='Confusion Matrix', cmap="YlGnBu",
+                          fontsize=16, symmetric=False):
+    N = len(classes)
+    confusion_matrix = np.zeros((N, N), dtype=np.int32)
+
+    classed_idxs = np.arange(N)
+    for i in range(len(predictions)):
+        row = np.where(classed_idxs == labels[i])[0][0]
+        col = np.where(classed_idxs == predictions[i])[0][0]
+        confusion_matrix[row][col] += 1
+
+    if symmetric:
+        confusion_matrix = (confusion_matrix + confusion_matrix.T) / 2
+
+    sns.set(font_scale=1.4)
+    sns.heatmap(confusion_matrix, annot=True, annot_kws={"size": fontsize}, cmap=cmap,
+                fmt='g')
+    plt.xlabel('Predicted labels')
+    plt.ylabel('True labels')
+    plt.title(title)
+    plt.xticks(np.arange(N) + 0.5, classes, rotation=90)
+    plt.yticks(np.arange(N) + 0.5, classes, rotation=0)
+    plt.show()
+    return confusion_matrix
+
+
+def _plot_confusion_matrix(confusion_matrix, classes, title='Confusion Matrix', cmap="YlGnBu",
+                           fontsize=16, symmetric=False):
+    N = len(confusion_matrix)
+    if symmetric:
+        confusion_matrix = (confusion_matrix + confusion_matrix.T)/2
+
+    sns.set(font_scale=1.4)
+    sns.heatmap(confusion_matrix, annot=True, annot_kws={"size": fontsize}, cmap=cmap,
+                fmt='g')
+    plt.xlabel('Predicted labels')
+    plt.ylabel('True labels')
+    plt.title(title)
+    plt.xticks(np.arange(N) + 0.5, classes, rotation=90)
+    plt.yticks(np.arange(N) + 0.5, classes, rotation=0)
+    plt.show()
+    return confusion_matrix
+
+
+
+
+
+---
+File: /icl/__init__.py
+---
+
+
+
+
+---
+File: /icl/project_constants.py
+---
+
+import os
+
+FOLDER_ROOT = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+
+
+
+---
+File: /attention_attr.py
+---
+
+import pickle
+import warnings
+from dataclasses import dataclass, field
+from typing import List
+import os
+import numpy as np
+from tqdm import tqdm
+from transformers.hf_argparser import HfArgumentParser
+import torch
+import torch.nn.functional as F
+
+from icl.lm_apis.lm_api_base import LMForwardAPI
+from icl.utils.data_wrapper import wrap_dataset, tokenize_dataset
+from icl.utils.load_huggingface_dataset import load_huggingface_dataset_train_and_test
+from icl.utils.prepare_model_and_tokenizer import load_model_and_tokenizer, \
+    get_label_id_dict_for_args
+from icl.utils.random_utils import set_seed
+from icl.utils.other import load_args, set_gpu, sample_two_set_with_shot_per_class
+from transformers import Trainer, TrainingArguments, PreTrainedModel, AutoModelForCausalLM, \
+    AutoTokenizer
+from icl.utils.load_local import convert_path_old, load_local_model_or_tokenizer, \
+    get_model_layer_num
+from icl.util_classes.arg_classes import AttrArgs
+from icl.util_classes.predictor_classes import Predictor
+from transformers import HfArgumentParser
+from datasets import concatenate_datasets
+from datasets.utils.logging import disable_progress_bar
+import icl.analysis.attentioner_for_attribution
+from icl.analysis.attentioner_for_attribution import AttentionAdapter, \
+    GPT2AttentionerManager
+from icl.utils.other import dict_to
+
+hf_parser = HfArgumentParser((AttrArgs,))
+args: AttrArgs = hf_parser.parse_args_into_dataclasses()[0]
+
+set_gpu(args.gpu)
+if args.sample_from == 'test':
+    dataset = load_huggingface_dataset_train_and_test(args.task_name)
+else:
+    raise NotImplementedError(f"sample_from: {args.sample_from}")
+
+model, tokenizer = load_model_and_tokenizer(args)
+args.label_id_dict = get_label_id_dict_for_args(args, tokenizer)
+
+# model = model.half()
+
+model = LMForwardAPI(model=model, model_name=args.model_name, tokenizer=tokenizer,
+                     device='cuda:0',
+                     label_dict=args.label_dict)
+
+
+num_layer = get_model_layer_num(model=model.model, model_name=args.model_name)
+predictor = Predictor(label_id_dict=args.label_id_dict, pad_token_id=tokenizer.pad_token_id,
+                      task_name=args.task_name, tokenizer=tokenizer, layer=num_layer)
+
+
+def prepare_analysis_dataset(seed):
+    if args.sample_from == 'test':
+        if len(dataset['test']) < args.actual_sample_size:
+            args.actual_sample_size = len(dataset['test'])
+            warnings.warn(
+                f"sample_size: {args.sample_size} is larger than test set size: {len(dataset['test'])},"
+                f"actual_sample_size is {args.actual_sample_size}")
+        test_sample = dataset['test'].shuffle(seed=seed).select(range(args.actual_sample_size))
+    else:
+        raise NotImplementedError(f"sample_from: {args.sample_from}")
+    disable_progress_bar()
+    demonstration = dataset['train']
+    class_num = len(set(demonstration['label']))
+    np_labels = np.array(demonstration['label'])
+    ids_for_demonstrations = [np.where(np_labels == class_id)[0] for class_id in range(class_num)]
+    demonstrations_contexted = []
+    np.random.seed(seed)
+    for i in range(len(test_sample)):
+        demonstration_part_ids = []
+        for _ in ids_for_demonstrations:
+            demonstration_part_ids.extend(np.random.choice(_, args.demonstration_shot))
+        demonstration_part = demonstration.select(demonstration_part_ids)
+        demonstration_part = demonstration_part.shuffle(seed=seed)
+        demonstration_part = wrap_dataset(test_sample.select([i]), demonstration_part,
+                                          args.label_dict,
+                                          args.task_name)
+        demonstrations_contexted.append(demonstration_part)
+    demonstrations_contexted = concatenate_datasets(demonstrations_contexted)
+    demonstrations_contexted = demonstrations_contexted.filter(
+        lambda x: len(tokenizer(x["sentence"])['input_ids']) <= tokenizer.max_len_single_sentence)
+    demonstrations_contexted = tokenize_dataset(demonstrations_contexted, tokenizer=tokenizer)
+    return demonstrations_contexted
+
+
+demonstrations_contexted = prepare_analysis_dataset(args.seeds[0])
+
+if args.model_name in ['gpt2-xl']:
+    attentionermanger = GPT2AttentionerManager(model.model)
+else:
+    raise NotImplementedError(f"model_name: {args.model_name}")
+
+training_args = TrainingArguments("./output_dir", remove_unused_columns=False,
+                                  per_device_eval_batch_size=1,
+                                  per_device_train_batch_size=1)
+trainer = Trainer(model=model, args=training_args)
+analysis_dataloader = trainer.get_eval_dataloader(demonstrations_contexted)
+
+
+for p in model.parameters():
+    p.requires_grad = False
+
+def get_proportion(saliency, class_poss, final_poss):
+    saliency = saliency.detach().clone().cpu()
+    class_poss = torch.hstack(class_poss).detach().clone().cpu()
+    final_poss = final_poss.detach().clone().cpu()
+    assert len(saliency.shape) == 2 or (len(saliency.shape) == 3 and saliency.shape[0] == 1)
+    if len(saliency.shape) == 3:
+        saliency = saliency.squeeze(0)
+    saliency = saliency.numpy()
+    np.fill_diagonal(saliency, 0)
+    proportion1 = saliency[class_poss, :].sum()
+    proportion2 = saliency[final_poss, class_poss].sum()
+    proportion3 = saliency.sum() - proportion1 - proportion2
+
+    N = int(final_poss)
+    sum3 = (N + 1) * N / 2 - sum(class_poss) - len(class_poss)
+    proportion1 = proportion1 / sum(class_poss)
+    proportion2 = proportion2 / len(class_poss)
+    proportion3 = proportion3 / sum3
+    proportions = np.array([proportion1, proportion2, proportion3])
+    return proportions
+
+
+pros_list = []
+
+for idx, data in tqdm(enumerate(analysis_dataloader)):
+    data = dict_to(data, model.device)
+    print(data['input_ids'].shape)
+    attentionermanger.zero_grad()
+    output = model(**data)
+    label = data['labels']
+    loss = F.cross_entropy(output['logits'], label)
+    loss.backward()
+    class_poss, final_poss = predictor.get_pos({'input_ids': attentionermanger.input_ids})
+    pros = []
+    for i in range(len(attentionermanger.attention_adapters)):
+        saliency = attentionermanger.grad(use_abs=True)[i]
+        pro = get_proportion(saliency, class_poss, final_poss)
+        pros.append(pro)
+    pros = np.array(pros)
+    pros = pros.T
+    pros_list.append(pros)
+
+pros_list = np.array(pros_list)
+
+os.makedirs(os.path.dirname(args.save_file_name), exist_ok=True)
+with open(args.save_file_name, 'wb') as f:
+    pickle.dump(pros_list, f)
+
+
+
+---
+File: /do_compress_time.py
+---
+
+from icl.analysis.compress_time import compress_time, CompressTimeArgs
+from transformers.hf_argparser import HfArgumentParser
+
+parser = HfArgumentParser((CompressTimeArgs,))
+args, = parser.parse_args_into_dataclasses()
+compress_time(args)
+
+
+---
+File: /do_compress_top.py
+---
+
+from icl.analysis.compress_top import compress, CompressTopArgs
+from transformers.hf_argparser import HfArgumentParser
+
+parser = HfArgumentParser((CompressTopArgs,))
+args, = parser.parse_args_into_dataclasses()
+compress(args)
+
+
+---
+File: /do_compress.py
+---
+
+from icl.analysis.compress import compress, CompressArgs
+from transformers.hf_argparser import HfArgumentParser
+
+parser = HfArgumentParser((CompressArgs,))
+args, = parser.parse_args_into_dataclasses()
+compress(args)
+
+
+---
+File: /do_deep_layer.py
+---
+
+from icl.analysis.deep_layer import deep_layer, DeepArgs
+from transformers.hf_argparser import HfArgumentParser
+
+parser = HfArgumentParser((DeepArgs,))
+args, = parser.parse_args_into_dataclasses()
+deep_layer(args)
+
+
+---
+File: /do_nclassify.py
+---
+
+from icl.analysis.n_classification import n_classify, NClassificationArgs
+from transformers.hf_argparser import HfArgumentParser
+
+parser = HfArgumentParser((NClassificationArgs,))
+args, = parser.parse_args_into_dataclasses()
+n_classify(args)
+
+
+---
+File: /do_shallow_layer_non_label.py
+---
+
+from icl.util_classes.arg_classes import ShallowNonLabelArgs
+from icl.analysis.shallow_layer_non_label import shallow_layer_non_label
+from transformers.hf_argparser import HfArgumentParser
+
+parser = HfArgumentParser((ShallowNonLabelArgs,))
+args, = parser.parse_args_into_dataclasses()
+shallow_layer_non_label(args)
+
+
+---
+File: /do_shallow_layer.py
+---
+
+from icl.util_classes.arg_classes import ShallowArgs
+from icl.analysis.shallow_layer import shallow_layer
+from transformers.hf_argparser import HfArgumentParser
+
+parser = HfArgumentParser((ShallowArgs,))
+args, = parser.parse_args_into_dataclasses()
+shallow_layer(args)
+
+
+---
+File: /experiment_attn_attr.py
+---
+
+from icl.utils.experiment_utils import Sh_run
+
+model_names = ['gpt2-xl']
+seeds = [42,43,44,45,46]
+task_names = ['agnews', 'trec','emo','sst2']
+hypers = [
+    {
+        'expr': 'python attention_attr.py',
+        'task_name': task_names,
+        "seed": seeds,
+        'model_name': model_names,
+        'sample_size': [1000],
+        'demonstration_shot': [1]
+    },
+]
+run = Sh_run(hyperparameter_lists=hypers,
+             gpu_list=[0,1,3,4])
+
+run.run()
+
+
+
+---
+File: /experiment_compress_time.py
+---
+
+from icl.utils.experiment_utils import Sh_run
+
+
+model_names = ['gpt2-xl']
+seeds = [42,43,44,45,46]
+task_names = ['sst2','agnews', 'trec','emo']
+hypers = [
+    {
+        'expr': 'python do_compress_time.py',
+        'task_name': task_names,
+        "seed": seeds,
+        'model_name': model_names,
+        'sample_size': [1000]
+    },
+]
+run = Sh_run(hyperparameter_lists=hypers,
+             gpu_list=[3,4])
+run.run()
+
+
+
+---
+File: /experiment_compress.py
+---
+
+from icl.utils.experiment_utils import Sh_run
+
+model_names = ['gpt-j-6b']
+seeds = [42,43,44,45,46]
+task_names = ['sst2','agnews', 'trec','emo']
+hypers = [
+    {
+        'expr': 'python do_compress.py',
+        'task_name': task_names,
+        "seed": seeds,
+        'model_name': model_names,
+        'sample_size': [1000]
+    },
+]
+run = Sh_run(hyperparameter_lists=hypers,
+             gpu_list=[4,5,6,7])
+
+run.run()
+
+
+
+---
+File: /experiment_deep.py
+---
+
+from icl.utils.experiment_utils import Sh_run
+
+model_names = ['gpt2-xl']
+seeds = [42,43,44,45,46]
+task_names = ['sst2','agnews', 'trec','emo']
+hypers = [
+    {
+        'expr': 'python do_deep_layer.py',
+        'task_name': task_names,
+        "seed": seeds,
+        'model_name': model_names,
+        'sample_size': [1000],
+        'demonstration_shot': [2]
+    },
+]
+run = Sh_run(hyperparameter_lists=hypers,
+             gpu_list=[0,1,3,4])
+
+run.run()
+
+
+
+---
+File: /experiment_ncls.py
+---
+
+from icl.utils.experiment_utils import Sh_run
+
+model_names = ['gpt2-xl']
+seeds = [42,43,44,45,46]
+task_names = ['agnews']
+hypers = [
+    {
+        'expr': 'python do_nclassify.py',
+        'task_name': task_names,
+        "seed": seeds,
+        'model_name': model_names,
+        'sample_size': [1000],
+        'demonstration_shot': [3]
+    },
+]
+run = Sh_run(hyperparameter_lists=hypers,
+             gpu_list=[3,5,1,4,6])
+
+run.run()
+
+
+
+---
+File: /experiment_reweighting.py
+---
+
+from icl.utils.experiment_utils import Sh_run
+
+model_names = ['gpt2-xl']
+seeds = [42,43,44,45,46]
+task_names = ['sst2','agnews', 'trec','emo']
+hypers = [
+    {
+        'expr': 'python reweighting.py',
+        'task_name': task_names,
+        "seed": seeds,
+        'model_name': model_names,
+        'sample_size': [1000],
+        'n_head': [25],
+        'lr':[0.01]
+    },
+]
+run = Sh_run(hyperparameter_lists=hypers,
+             gpu_list=[1,2,3,4,5,6,7])
+
+run.run()
+
+
+
+---
+File: /experiment_shallow.py
+---
+
+from icl.utils.experiment_utils import Sh_run
+
+
+model_names = ['gpt-j-6b']
+seeds = [42,43,44,45,46]
+task_names = ["emo", 'sst2', 'agnews', 'trec']
+mask_layer_nums = [5,1,3,7]
+hypers = [
+    {
+        'expr': 'python do_shallow_layer.py',
+        # change to do_shallow_layer_non_label.py if you want to run that
+        'task_name': task_names,
+        "seed": seeds,
+        'model_name': model_names,
+        'mask_layer_num': mask_layer_nums,
+        'mask_layer_pos': ['last', 'first'],
+        'sample_size': [1000],
+        'demonstration_shot':[1,2],
+    },
+
+]
+run = Sh_run(hyperparameter_lists=hypers,
+             gpu_list=[0,1,2,3,4,5])
+
+run.run()
+
+
+
+---
+File: /grad_demo.py
+---
+
+from icl.analysis.activation_analysis import start_save, end_save, get_result, add_activation, add_activation_grad
+
+import torch
+log_dir = './tmp_log'
+start_save(log_dir, save_activation=True, save_activation_grad=True, debug=True, cover = True)
+a = torch.randn(2, 3, 4, 5)
+c = a*2
+c = add_activation(c, 'c')
+c = add_activation_grad(c, 'c')
+e = c.sum()
+e.backward() # 必须手动加上backward（但是requires_grad之类的会自动处理），否则grad不会被记录
+end_save()
+print('here')
+print(get_result(log_dir, 'c'))
+print(get_result(log_dir, 'c_grad'))
+
+
+
+---
+File: /reweighting.py
+---
+
+from icl.analysis.reweighting import train, ReweightingArgs
+from transformers.hf_argparser import HfArgumentParser
+
+parser = HfArgumentParser((ReweightingArgs,))
+args, = parser.parse_args_into_dataclasses()
+train(args)
