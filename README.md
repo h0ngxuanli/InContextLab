@@ -10,7 +10,7 @@
 In-context learning enables a large language model(LLM) to perform tasks by observing patterns from examples provided in the input prompt, without updating its parameters.
 
 <p align="center">
-<img src="./images/icl.gif" alt="In-Context Learning in Large Language Models" width="300"/>
+<img src="./images/icl.gif" alt="In-Context Learning in Large Language Models" width="600"/>
 </p>
 
 *Figure source: [In-Context Learning in Large Language Models](https://medium.com/@vjanand/in-context-learning-in-large-language-models-df6f486edf2c)*
