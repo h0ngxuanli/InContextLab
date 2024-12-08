@@ -10,6 +10,7 @@ class TaskType(Enum):
 class Metadata:
     task_type: TaskType
     task_name: Optional[str] = None
+    demonstration_type: Optional[str] = None
     split: Optional[str] = None
     additional_info: Optional[Dict[str, Any]] = None
 
@@ -32,7 +33,7 @@ class BaseICLModel:
         self.model_name = model_name
         self.device = device
 
-    def process_examples(self, examples: List[Example]) -> ModelOutput:
+    def process_demonstrations(self, examples: List[Example]) -> ModelOutput:
         raise NotImplementedError
 
     def visualize_results(self, output: ModelOutput) -> None:

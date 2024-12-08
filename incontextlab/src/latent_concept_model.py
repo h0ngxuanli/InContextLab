@@ -9,6 +9,7 @@ from torch.optim import AdamW
 from .base import BaseICLModel, ModelRegistry, Example, ModelOutput
 from .config import ModelConfig, setup_logging
 
+
 logger = setup_logging(__name__)
 
 class CausalDirection(Enum):
@@ -82,7 +83,7 @@ class LatentConceptModel(BaseICLModel):
         # Optimizer for concept token embeddings
         optimizer = AdamW([{
             'params': embed_layer.weight,
-            'lr': self.config.learning_rate
+            'lr': self.config.concept_learning_rate
         }])
         
         new_token_ids = torch.tensor(
@@ -90,11 +91,11 @@ class LatentConceptModel(BaseICLModel):
             device=self.device
         )
 
-        for step in range(self.config.num_train_steps):
+        for step in range(self.config.concept_train_steps):
             # Create batch
             batch = random.sample(
                 train_data,
-                min(self.config.batch_size, len(train_data))
+                min(self.config.concept_batch_size, len(train_data))
             )
             optimizer.zero_grad()
             total_loss = torch.tensor(0.0, device=self.device)
@@ -154,8 +155,54 @@ class LatentConceptModel(BaseICLModel):
             shift_labels.view(-1)
         )
 
-    def compute_token_contributions(self, sequence: str) -> List[Dict]:
+    def score_demonstrations(
+        self, 
+        pool: List[Dict], 
+        concept_token: str, 
+        test_input: str
+    ) -> List[Dict]:
+        """Score demonstrations based on their relevance to test input."""
+        scores = []
+        for demo in pool:
+            sequence = f"{concept_token} {demo['text']} {concept_token} {test_input} {self.tokenizer.eos_token}"
+            inputs = self.tokenizer(
+                sequence,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.config.max_length
+            ).to(self.device)
+            
+            embed_layer = self.model.get_input_embeddings()
+            input_embeddings = embed_layer(inputs["input_ids"]).clone().detach().requires_grad_(True)
+
+            outputs = self.model(inputs_embeds=input_embeddings, output_attentions=True)
+            logits = outputs.logits
+
+            logits_sum = logits.sum()
+            token_grads = torch.autograd.grad(
+                outputs=logits_sum,
+                inputs=input_embeddings,
+                retain_graph=True
+            )[0]
+            
+            demo_score = token_grads.norm(dim=-1).sum().item()
+            scores.append({"demo": demo, "score": demo_score})
+
+        total_score = sum(score["score"] for score in scores)
+        for score in scores:
+            score["score"] /= total_score
+
+        return sorted(scores, key=lambda x: x["score"], reverse=True)
+
+    def compute_token_contributions(
+        self, 
+        sequence: str,
+        test_input: Optional[str] = None
+    ) -> List[Dict]:
         """Compute token contributions through gradient analysis."""
+        if test_input:
+            sequence = f"{sequence} {self.tokenizer.eos_token} {test_input}"
+            
         inputs = self.tokenizer(
             sequence,
             return_tensors="pt",
@@ -166,7 +213,6 @@ class LatentConceptModel(BaseICLModel):
         embed_layer = self.model.get_input_embeddings()
         input_embeddings = embed_layer(inputs["input_ids"]).clone().detach().requires_grad_(True)
 
-        # Forward pass
         outputs = self.model(
             inputs_embeds=input_embeddings,
             output_attentions=True,
@@ -176,7 +222,6 @@ class LatentConceptModel(BaseICLModel):
         attentions = outputs.attentions
         logits = outputs.logits
 
-        # Compute gradients
         logits_sum = logits.sum()
         token_grads = torch.autograd.grad(
             outputs=logits_sum,
@@ -184,7 +229,6 @@ class LatentConceptModel(BaseICLModel):
             retain_graph=True
         )[0]
 
-        # Combine contributions
         layer_contributions = []
         for layer_attention in attentions:
             avg_attention = layer_attention.mean(dim=1)
@@ -203,47 +247,6 @@ class LatentConceptModel(BaseICLModel):
             for token, contribution in zip(tokens, contributions[0])
         ]
 
-    def score_demonstrations(
-        self, 
-        pool: List[Dict], 
-        concept_token: str, 
-        test_input: str
-    ) -> List[Dict]:
-        """Score demonstrations based on their relevance."""
-        scores = []
-        for demo in pool:
-            sequence = f"{concept_token} {demo['text']} {demo['label']} {self.tokenizer.eos_token}"
-            inputs = self.tokenizer(
-                sequence,
-                return_tensors="pt",
-                truncation=True,
-                max_length=self.config.max_length
-            ).to(self.device)
-            
-            embed_layer = self.model.get_input_embeddings()
-            input_embeddings = embed_layer(inputs["input_ids"]).clone().detach().requires_grad_(True)
-
-            outputs = self.model(inputs_embeds=input_embeddings, output_attentions=True)
-            logits = outputs.logits
-
-            # Compute score as gradient norm
-            logits_sum = logits.sum()
-            token_grads = torch.autograd.grad(
-                outputs=logits_sum,
-                inputs=input_embeddings,
-                retain_graph=True
-            )[0]
-            
-            demo_score = token_grads.norm(dim=-1).sum().item()
-            scores.append({"demo": demo, "score": demo_score})
-
-        # Normalize scores
-        total_score = sum(score["score"] for score in scores)
-        for score in scores:
-            score["score"] /= total_score
-
-        return sorted(scores, key=lambda x: x["score"], reverse=True)
-
     def select_top_k_demonstrations(
         self,
         pool: List[Dict],
@@ -253,11 +256,19 @@ class LatentConceptModel(BaseICLModel):
     ) -> List[Dict]:
         """Select top-k demonstrations based on scores."""
         scored_demos = self.score_demonstrations(pool, concept_token, test_input)
-        return scored_demos[:k]
+        selected_demos = scored_demos[:k]
+        
+        for demo in selected_demos:
+            sequence = f"{concept_token} {demo['demo']['text']}"
+            demo['token_contributions'] = self.compute_token_contributions(
+                sequence,
+                test_input=test_input
+            )
+        
+        return selected_demos
 
-    def process_examples(self, examples: List[Example]) -> ModelOutput:
+    def process_demonstrations(self, examples: List[Example]) -> ModelOutput:
         """Process examples through the Latent Concept pipeline."""
-        # Extract tasks and prepare data
         tasks = list(set(ex.metadata.task_name for ex in examples if ex.metadata))
         
         train_data = [
@@ -265,7 +276,6 @@ class LatentConceptModel(BaseICLModel):
             for ex in examples if ex.metadata and ex.metadata.split == "train"
         ]
         
-        # Train concept tokens
         concept_tokens = self.add_concept_tokens(tasks)
         self.train_concept_tokens(
             train_data,
@@ -273,9 +283,9 @@ class LatentConceptModel(BaseICLModel):
             direction=CausalDirection.X_TO_Y
         )
 
-        # Score demonstrations
         demo_pool = [ex for ex in examples if ex.metadata and ex.metadata.split == "demonstration_pool"]
         scored_demos = []
+        token_contributions = {}
         
         for test_ex in examples:
             if test_ex.metadata and test_ex.metadata.split == "test":
@@ -283,16 +293,18 @@ class LatentConceptModel(BaseICLModel):
                     [{"text": d.text, "label": d.labels[0]} for d in demo_pool],
                     concept_tokens[0],
                     test_ex.text,
-                    k=self.config.top_k_samples
+                    k=self.config.top_k_demons
                 )
+                
+                for demo in demos:
+                    sequence = f"{concept_tokens[0]} {demo['demo']['text']}"
+                    contributions = self.compute_token_contributions(
+                        sequence,
+                        test_input=test_ex.text
+                    )
+                    token_contributions[demo['demo']['text']] = contributions
+                
                 scored_demos.extend(demos)
-
-        # Compute token contributions
-        token_contributions = {}
-        for demo in scored_demos:
-            sequence = f"{concept_tokens[0]} {demo['demo']['text']}"
-            contributions = self.compute_token_contributions(sequence)
-            token_contributions[demo['demo']['text']] = contributions
 
         return ModelOutput(
             scores={str(i): demo["score"] for i, demo in enumerate(scored_demos)},
@@ -304,7 +316,6 @@ class LatentConceptModel(BaseICLModel):
     def visualize_results(self, output: ModelOutput) -> None:
         """Visualize the results using the dashboard visualizer."""
         from .config import Visualizer
-        Visualizer.create_token_visualization(
-            data=output.visualizations["demonstrations"],
-            title="Latent Concept Analysis Results"
+        Visualizer.create_latent_concept_visualization(
+            output
         )

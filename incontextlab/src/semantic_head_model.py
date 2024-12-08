@@ -1,12 +1,15 @@
+
+
 import torch
 import numpy as np
+import sys
+sys.path.append('..')
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import List, Dict, Tuple, Optional
-from .base import BaseICLModel, ModelRegistry, Example, ModelOutput
-from .config import ModelConfig, setup_logging
+from incontextlab.src.base import BaseICLModel, ModelRegistry, Example, ModelOutput
+from incontextlab.src.config import ModelConfig, setup_logging
 
 logger = setup_logging(__name__)
-
 def clean_tokens(tokens: List[str]) -> List[str]:
     """Clean special tokens from tokenizer output."""
     return [token.lstrip('Ġ') for token in tokens if len(token.lstrip('Ġ')) != 0]
@@ -28,9 +31,9 @@ class SemanticHeadModel(BaseICLModel):
         }
 
     def setup_model(self):
-        """Initialize model components."""
+        """Initialize the semantic head model."""
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name, 
+            self.model_name,
             output_attentions=True
         ).to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
@@ -40,11 +43,19 @@ class SemanticHeadModel(BaseICLModel):
         self.model.eval()
 
     def get_layer_weight(self, layer_idx: int, weight_name: str) -> torch.Tensor:
-        """Get layer weights in a flexible way."""
-        return self.model.get_submodule(f'transformer.h.{layer_idx}.attn').get_parameter(weight_name)
+        """Retrieve specific layer weights using get_submodule."""
+        try:
+            return self.model.get_submodule(f'transformer.h.{layer_idx}.attn').get_parameter(weight_name)
+        except AttributeError:
+            # Fallback to direct access if get_submodule fails
+            layer = self.model.transformer.h[layer_idx]
+            weight = getattr(layer, weight_name, None)
+            if weight is None:
+                raise ValueError(f"Weight {weight_name} not found in layer {layer_idx}")
+            return weight
 
-    def process_examples(self, examples: List[Example]) -> ModelOutput:
-        """Process examples through the Semantic Head pipeline."""
+    def process_demonstrations(self, examples: List[Example]) -> ModelOutput:
+        """Process examples and generate model outputs."""
         relation_indices_list = []
         attention_patterns = []
         
@@ -81,8 +92,9 @@ class SemanticHeadModel(BaseICLModel):
         # Average results
         mean_relation_indices = np.mean(relation_indices_list, axis=0)
 
+
         return ModelOutput(
-            scores={},  # No explicit scores for this model
+            scores={},
             explanations={
                 "relation_indices": mean_relation_indices,
                 "attention_patterns": attention_patterns
@@ -97,12 +109,13 @@ class SemanticHeadModel(BaseICLModel):
         attention_mask: torch.Tensor
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Analyze attention patterns from model."""
-        outputs = self.model(
-            input_ids, 
-            attention_mask=attention_mask, 
-            output_attentions=True
-        )
-        attentions = outputs.attentions
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids, 
+                attention_mask=attention_mask, 
+                output_attentions=True
+            )
+            attentions = outputs.attentions
         
         # Get OV circuits for all layers
         ov_circuits = []
@@ -110,7 +123,6 @@ class SemanticHeadModel(BaseICLModel):
             ov_circuits.append(self.get_layer_weight(i, 'c_proj.weight'))
             
         return attentions, ov_circuits
-
     def compute_relation_index(
         self, 
         attentions: List[torch.Tensor], 
@@ -128,37 +140,47 @@ class SemanticHeadModel(BaseICLModel):
         
         tokens = [self.tokenizer.decode(t) for t in input_ids[0].cpu().numpy()]
         
+        def find_compound_positions(target: str, token_list: List[str]) -> List[int]:
+            """Find positions for potentially multi-token targets."""
+            # Split target into individual words
+            target_words = target.lower().split()
+            positions = []
+            
+            # Find positions where any of the target words appear
+            for i, token in enumerate(token_list):
+                token = token.strip().lower()
+                if any(word in token for word in target_words):
+                    positions.append(i)
+            
+            return positions
+        
         for layer_idx, layer_attn in enumerate(attentions):
             for head_idx in range(num_heads):
                 head_scores = []
-                
                 for triplet in triplets:
                     head, rel, tail = triplet
                     
-                    # Find token positions
-                    head_positions = [i for i, t in enumerate(tokens) if head in t]
-                    tail_positions = [i for i, t in enumerate(tokens) if tail in t]
+                    # Use compound matching for both head and tail
+                    head_positions = find_compound_positions(head, tokens)
+                    tail_positions = find_compound_positions(tail, tokens)
                     
                     if not head_positions or not tail_positions:
                         continue
                     
-                    head_idx_pos = sum(head_positions) / len(head_positions)
-                    tail_idx_pos = sum(tail_positions) / len(tail_positions)
+                    head_idx_pos = int(sum(head_positions) / len(head_positions))
+                    tail_idx_pos = int(sum(tail_positions) / len(tail_positions))
 
-                    # Get attention weights
                     attention_weights = layer_attn[0, head_idx, :, :].detach().cpu().numpy()
                     
-                    # Apply threshold
-                    if attention_weights[int(tail_idx_pos), int(head_idx_pos)] / np.max(attention_weights[int(tail_idx_pos), :]) <= tau:
+                    threshold_ratio = attention_weights[tail_idx_pos, head_idx_pos] / np.max(attention_weights[tail_idx_pos, :])
+                    if threshold_ratio <= tau:
                         continue
                     
-                    # Compute OV influence
-                    ov_influence = torch.matmul(ov_circuits[layer_idx][head_idx], vocab_matrix.T)
+                    ov_influence = torch.matmul(vocab_matrix, ov_circuits[layer_idx][head_idx].T)
                     ov_influence = ov_influence / ov_influence.max()
                     
-                    # Calculate score based on relation type
-                    qk_score = attention_weights[int(tail_idx_pos), int(head_idx_pos)]
-                    ov_score = ov_influence[int(tail_idx_pos)].item()
+                    qk_score = attention_weights[tail_idx_pos, head_idx_pos]
+                    ov_score = ov_influence[tail_idx_pos].item()
                     
                     if relation_type == "semantic":
                         score = qk_score * ov_score * self.get_semantic_factor(rel)
@@ -167,16 +189,13 @@ class SemanticHeadModel(BaseICLModel):
                     
                     head_scores.append(score)
 
-                # Compute final score for head
                 if head_scores:
                     relation_indices[layer_idx, head_idx] = np.mean(head_scores)
 
-        # Normalize scores
         if relation_indices.max() > relation_indices.min():
             relation_indices = (relation_indices - relation_indices.min()) / (relation_indices.max() - relation_indices.min())
         
         return relation_indices
-
     def get_semantic_factor(self, relation: str) -> float:
         """Return a factor based on the semantic relation type."""
         return self.semantic_factors.get(relation, 1.0)
@@ -226,7 +245,7 @@ class SemanticHeadModel(BaseICLModel):
 
             combined_contributions = torch.stack(layer_contributions).mean(dim=0)
             contribution_scores = combined_contributions.sum(dim=-1).detach().cpu().numpy()
-            contribution_scores = contribution_scores / contribution_scores.sum()
+            contribution_scores = contribution_scores / (contribution_scores.sum() + 1e-9)
 
             tokens = clean_tokens(
                 self.tokenizer.convert_ids_to_tokens(inputs["input_ids"].squeeze(0))
@@ -241,7 +260,7 @@ class SemanticHeadModel(BaseICLModel):
 
     def visualize_results(self, output: ModelOutput) -> None:
         """Visualize the results using the heatmap visualization."""
-        from .config import Visualizer
+        from incontextlab.src.config import Visualizer
         
         # Create heatmap of relation indices
         heatmap_data = output.visualizations["heatmap_data"]
@@ -249,10 +268,4 @@ class SemanticHeadModel(BaseICLModel):
             data=heatmap_data,
             title="Semantic Head Analysis - Relation Indices"
         )
-        
-        # Create token contribution visualization if available
-        if "token_contributions" in output.additional_info:
-            Visualizer.create_token_visualization(
-                data=output.additional_info["token_contributions"],
-                title="Token Contributions Analysis"
-            )
+    

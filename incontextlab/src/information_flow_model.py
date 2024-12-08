@@ -134,9 +134,10 @@ class SaliencyAnalyzer:
             total += saliency[:, :, i, j].sum().item()
             
         return total / len(connections) if connections else 0.0
-
+    
 @ModelRegistry.register("information_flow")
 class InformationFlowModel(BaseICLModel):
+
     def __init__(self, config: ModelConfig):
         super().__init__(config.model_name, config.device)
         self.config = config
@@ -219,26 +220,30 @@ class InformationFlowModel(BaseICLModel):
         last_demo_start = positions[-1]
         target_position = last_demo_start + demo_length
         return min(target_position, len(input_ids) - 1)
-
-    def process_examples(self, examples: List[Example]) -> ModelOutput:
+    def process_demonstrations(self, examples: List[Example]) -> ModelOutput:
         """Process examples through the Information Flow pipeline."""
-        demonstration_text = ""
+        if not examples:
+            raise ValueError("Must provide at least one example")
+            
+        # Get task type and name from first example's metadata
+        task_type = examples[0].metadata.task_type.name.capitalize()
+        task_name = examples[0].metadata.task_name.capitalize()
+        demonstration_type = examples[0].metadata.demonstration_type
+        
+        # Build full text starting with task type
+        full_text = f"{task_type}:\n"
         labels = []
         
-        # Build demonstration text and collect labels
-        for example in examples:
-            if example.metadata and example.metadata.split == "demonstration":
-                text = example.text
-                label = example.labels[0]
-                demonstration_text += f"Demonstration: {text}\nLabel: {label}\n\n"
-                labels.append(label)
-        
-        # Process final example
-        final_example = next(
-            ex for ex in examples 
-            if ex.metadata and ex.metadata.split == "test"
-        )
-        full_text = f"{demonstration_text}Demonstration: {final_example.text}\nLabel:"
+        # Process all but last example
+        for example in examples[:-1]:
+            text = example.text
+            label = example.labels[0]
+            full_text += f"{demonstration_type}: {text}\n{task_name}: {label}\n\n"
+            labels.append(label)
+            
+        # Add final example without label
+        final_example = examples[-1]
+        full_text += f"{demonstration_type}: {final_example.text}\n{task_name}:"
 
         # Tokenize and prepare inputs
         inputs = self.tokenizer(
@@ -248,10 +253,26 @@ class InformationFlowModel(BaseICLModel):
         ).to(self.device)
         
         input_ids = inputs["input_ids"][0]
-        target_position = self.find_last_demonstration_position(input_ids)
+        
+        # Find target position (last task_name token)
+        target_token_ids = self.tokenizer.encode(
+            f"{task_name}:",
+            add_special_tokens=False
+        )
+        positions = []
+        
+        for i in range(len(input_ids) - len(target_token_ids) + 1):
+            if torch.all(input_ids[i:i + len(target_token_ids)] == torch.tensor(target_token_ids)):
+                positions.append(i)
+                
+        if not positions:
+            raise ValueError(f"Could not find '{task_name}:' token")
+            
+        target_position = positions[-1] + len(target_token_ids)
+        target_position = min(target_position, len(input_ids) - 1)
         
         # Get model outputs
-        self.model.train()  # Enable gradient computation
+        self.model.train()
         outputs = self.model(**inputs, labels=inputs["input_ids"])
         
         # Compute saliency scores
@@ -276,7 +297,7 @@ class InformationFlowModel(BaseICLModel):
         layers = list(range(1, len(metrics["S_wp"]) + 1))
         
         return ModelOutput(
-            scores={},  # No explicit scores for this model
+            scores={},
             explanations={
                 "flow_metrics": metrics,
                 "saliency_scores": saliency_scores
@@ -293,12 +314,14 @@ class InformationFlowModel(BaseICLModel):
                 "attention_patterns": [a.detach().cpu().numpy() for a in outputs.attentions]
             }
         )
-
     def visualize_results(self, output: ModelOutput) -> None:
         """Visualize the information flow results."""
         from .config import Visualizer
+        
+        flow_data = output.visualizations["flow_data"]
+        
         Visualizer.create_flow_visualization(
-            output.visualizations["flow_data"]["layers"],
-            output.visualizations["flow_data"]["metrics"],
-            "Information Flow Analysis Across Layers"
+            layers=flow_data["layers"],
+            flow_metrics=flow_data["metrics"],
+            title="Information Flow Across Layers"
         )
