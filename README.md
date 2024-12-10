@@ -1,6 +1,6 @@
 <p align="center">
 	<img align="center" width=60% src="./images/logo.png"> </img>	 <br/>
-	Python package for interpreting LLMs In-Context Learning <br/>
+	Harness XAI, demystify in-context learning, and elevate your LLMs—all at zero cost <br/>
 </p>
 
 
@@ -36,10 +36,10 @@ In-context learning enables a large language model(LLM) to perform tasks by obse
 
 | Model | Reference | Description | XAI Technique |
 | :---- | :-------- | :---------- | :------------ |
-| Label Words as Anchors | [🗂️](https://github.com/h0ngxuanli/InContextLab/blob/main/incontextlab/information_flow.py), [📄](https://arxiv.org/abs/2305.14160) | Analyzes in-context learning by using label words as fixed reference points to track information flow within language models | Intrinsic Interpretability |
-| LLMs as Latent Variable Models | [🗂️](https://github.com/h0ngxuanli/InContextLab/blob/main/incontextlab/latent_concept.py), [📄](https://arxiv.org/pdf/2301.11916) | Frames large language models as latent variable models to explain in-context learning and find optimal demonstrations | Surrogate Models |
-| Semantic Induction Heads | [🗂️](https://github.com/h0ngxuanli/InContextLab/blob/main/incontextlab/semantic_induction_heads.py), [📄](https://arxiv.org/abs/2402.13055) | Identifies and analyzes semantic induction heads to understand in-context learning mechanisms in language models | Feature Attribution |
-| Post Hoc Explanations | [🗂️](https://github.com/h0ngxuanli/InContextLab/blob/main/incontextlab/amplify.py), [📄](https://openreview.net/forum?id=3H37XciUEv) | Generates explanations after model predictions to improve performance and interpretability of language models | Surrogate Models |
+| Label Words as Anchors | [🗂️](https://github.com/h0ngxuanli/InContextLab/blob/main/incontextlab/src/information_flow_model.py), [📄](https://arxiv.org/abs/2305.14160) | Analyzes in-context learning by using label words as fixed reference points to track information flow within language models | Intrinsic Interpretability |
+| LLMs as Latent Variable Models | [🗂️](https://github.com/h0ngxuanli/InContextLab/blob/main/incontextlab/src/latent_concept_model.py), [📄](https://arxiv.org/pdf/2301.11916) | Frames large language models as latent variable models to explain in-context learning and find optimal demonstrations | Surrogate Models |
+| Semantic Induction Heads | [🗂️](https://github.com/h0ngxuanli/InContextLab/blob/main/incontextlab/src/semantic_head_model.py), [📄](https://arxiv.org/abs/2402.13055) | Identifies and analyzes semantic induction heads to understand in-context learning mechanisms in language models | Feature Attribution |
+| Post Hoc Explanations | [🗂️](https://github.com/h0ngxuanli/InContextLab/blob/main/incontextlab/src/amplify_model.py), [📄](https://openreview.net/forum?id=3H37XciUEv) | Generates explanations after model predictions to improve performance and interpretability of language models | Surrogate Models |
 
 ## Model Explanations
 
@@ -287,7 +287,7 @@ This framework leverages MCS-based demonstration selection and gradient-based ex
 
 1. **Label Words are Anchors: An Information Flow Perspective for Understanding In-Context Learning**
 
-   *Authors:* [Not specified in the provided information]
+   *Authors:* Lean Wang, Lei Li, Damai Dai, Deli Chen, Hao Zhou, Fandong Meng, Jie Zhou, Xu Sun
 
    *Repository:* [https://github.com/lancopku/label-words-are-anchors](https://github.com/lancopku/label-words-are-anchors)
 

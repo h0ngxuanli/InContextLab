@@ -144,7 +144,7 @@ class Visualizer:
                 {% endfor %}
             </div>
 
-            <div class="section-title">Generated Training Prompt</div>
+            <div class="section-title">Generated Corrective Prompt</div>
             <div class="prompt-container">
                 <pre style="margin: 0; white-space: pre-wrap;">{{ prompt }}</pre>
             </div>
